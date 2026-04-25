@@ -1,0 +1,19 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Output files
+output_4ply/
+
+# VS Code
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
