@@ -14,6 +14,19 @@ output_4ply/
 # VS Code
 .vscode/
 
+# Copilot
+.claude/
+
 # OS
 Thumbs.db
 .DS_Store
+output_annulusfiller/fill_progress.png
+output_annulusfiller/fill_sequence_2d.png
+output_annulusfiller/fill_sequence_3d.png
+output_annulusfiller/mesh_overview.png
+output_lcm/compare.png
+output_lcm/curve.png
+output_lcm/fill_rtm.png
+output_lcm/fill_vari.png
+output_lcm/porosity.png
+output_lcm/thickness.png
