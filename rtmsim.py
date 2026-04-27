@@ -174,6 +174,53 @@ class SimParameters:
     # secondary injection port.
     cascade_events: list = field(default_factory=list)
 
+    # ----------------------------------------------------------------------
+    # Thermal + cure (1D through-thickness lumped model)
+    # ----------------------------------------------------------------------
+    # When thermal_enabled is False the solver behaves exactly as before.
+    # When True, each cell carries a single temperature T (through-
+    # thickness average); heat loss to the tool is modelled as a Newton
+    # cooling sink 2*h_tool/h_thk*(T - T_tool) — the analytical 1D
+    # through-thickness profile collapsed into a per-cell sink term.
+    thermal_enabled: bool = False
+    cure_enabled: bool = False
+
+    # Initial / boundary conditions [K]
+    T_init: float = 298.15        # initial preform/mold temperature
+    T_inlet: float = 333.15       # incoming resin temperature
+    T_tool: float = 333.15        # tool/wall temperature (Dirichlet sink)
+    h_tool: float = 1000.0        # tool-resin heat transfer coeff [W/(m^2 K)]
+
+    # Thermal properties
+    cp_resin: float = 1800.0      # [J/(kg K)]
+    cp_fiber: float = 800.0       # [J/(kg K)]
+    rho_fiber: float = 2540.0     # [kg/m^3]
+    k_resin: float = 0.2          # [W/(m K)]
+    k_fiber: float = 1.0          # [W/(m K)]
+    enable_inplane_conduction: bool = False  # usually negligible in shells
+
+    # Cure exotherm (Kamal-Sourour)
+    H_total: float = 350.0e3      # total heat of reaction [J/kg resin]
+    A1_cure: float = 2.0e3        # [1/s]
+    A2_cure: float = 2.0e5        # [1/s]
+    E1_cure: float = 5.0e4        # [J/mol]
+    E2_cure: float = 6.0e4        # [J/mol]
+    m_cure: float = 0.5
+    n_cure: float = 1.5
+    alpha_init: float = 0.0       # initial conversion
+
+    # Viscosity model: mu(T, alpha) = mu_inf * exp(E_mu/RT)
+    #                                  * (alpha_g/(alpha_g - alpha))^(C1 + C2*alpha)
+    # When cure_enabled is False the Castro factor is omitted.
+    # Defaults are tuned so mu(T=333 K, alpha=0) ≈ 0.10 Pa s, matching
+    # the existing iso-thermal demos. Real resins should override these.
+    mu_inf: float = 2.0e-6        # [Pa s]
+    E_mu: float = 3.0e4           # [J/mol]
+    alpha_gel: float = 0.6
+    C1_visc: float = 1.5
+    C2_visc: float = 1.0
+    mu_max: float = 1.0e3         # cap to avoid blow-up near gel [Pa s]
+
     def validate(self):
         if self.i_model not in (1, 2, 3):
             raise ValueError("i_model must be 1, 2, or 3")
@@ -181,6 +228,16 @@ class SimParameters:
             raise ValueError("tmax must be > 0")
         if self.p_inlet <= self.p_init:
             raise ValueError("p_inlet must be > p_init")
+        if self.thermal_enabled:
+            if self.T_init <= 0 or self.T_inlet <= 0 or self.T_tool <= 0:
+                raise ValueError("Temperatures must be > 0 K (use Kelvin)")
+            if self.h_tool < 0 or self.cp_resin <= 0 or self.cp_fiber <= 0:
+                raise ValueError("h_tool, cp_resin, cp_fiber must be positive")
+        if self.cure_enabled:
+            if not self.thermal_enabled:
+                raise ValueError("cure_enabled requires thermal_enabled=True")
+            if not (0.0 <= self.alpha_init < self.alpha_gel <= 1.0):
+                raise ValueError("Need 0 <= alpha_init < alpha_gel <= 1")
         if self.stack is None or not getattr(self.stack, "plies", None):
             raise ValueError("A LaminateStack with plies is required")
         if self.i_model == 3:
@@ -242,6 +299,10 @@ class Snapshot:
     # offset is (p_init - p_eps); for i_model=2/3 the stored p is
     # already absolute and the offset is 0.
     p_offset: float = 0.0
+    # Thermal/cure state — None when thermal/cure are disabled.
+    T: np.ndarray = None          # [K] per cell
+    alpha: np.ndarray = None      # cure conversion in [0, 1]
+    mu: np.ndarray = None         # [Pa s] per cell (instantaneous)
 
 
 def pressure_absolute(snap):
@@ -954,6 +1015,203 @@ def _step_jit(
         gamma_vof[i] = g_new[i]
 
 
+# --------------------------------------------------------------------------
+# Thermal / cure helpers + kernel
+# --------------------------------------------------------------------------
+R_GAS = 8.314462618  # [J/(mol K)]
+
+
+@njit(cache=True, fastmath=True)
+def _viscosity_TA(T, alpha, mu_inf, E_mu, alpha_gel,
+                  C1, C2, mu_max, cure_on):
+    """
+    Castro-Macosko viscosity. Vectorised in-place semantics: returns a new
+    array. When cure_on=False, only the Arrhenius term is applied.
+
+    The Arrhenius exponent is clamped to a value that keeps exp() finite
+    (~700 in float64) so unreasonably cold T just returns mu_max instead
+    of raising an overflow warning.
+    """
+    N = T.size
+    out = np.empty(N)
+    EXP_MAX = 700.0
+    for i in range(N):
+        Ti = T[i]
+        if Ti < 1.0:
+            Ti = 1.0
+        arg = E_mu / (R_GAS * Ti)
+        if arg > EXP_MAX:
+            mu = mu_max
+        else:
+            mu = mu_inf * np.exp(arg)
+        if cure_on:
+            ai = alpha[i]
+            if ai >= alpha_gel:
+                mu = mu_max
+            else:
+                ratio = alpha_gel / (alpha_gel - ai)
+                expn = C1 + C2 * ai
+                mu = mu * ratio ** expn
+        if mu > mu_max:
+            mu = mu_max
+        if mu < 1e-6:
+            mu = 1e-6
+        out[i] = mu
+    return out
+
+
+@njit(cache=True, fastmath=True)
+def _cure_rate(T, alpha, A1, A2, E1, E2, m, n):
+    """Kamal-Sourour: dα/dt = (k1 + k2 α^m)(1-α)^n. Returns array."""
+    N = T.size
+    out = np.empty(N)
+    for i in range(N):
+        Ti = T[i]
+        if Ti < 1.0:
+            Ti = 1.0
+        ai = alpha[i]
+        if ai < 0.0:
+            ai = 0.0
+        if ai > 1.0:
+            ai = 1.0
+        k1 = A1 * np.exp(-E1 / (R_GAS * Ti))
+        k2 = A2 * np.exp(-E2 / (R_GAS * Ti))
+        out[i] = (k1 + k2 * ai ** m) * (1.0 - ai) ** n
+    return out
+
+
+@njit(cache=True, fastmath=True)
+def _step_thermal_jit(
+    ct, nbrs, volume,
+    face_nx, face_ny, face_area,
+    T11, T12, T21, T22,
+    thickness, porosity, gamma_vof,
+    rho_resin, cp_resin, rho_fiber, cp_fiber,
+    h_tool, T_tool,
+    cure_on, H_total,
+    A1, A2, E1, E2, m_kin, n_kin,
+    u, v, T, alpha,
+    dt,
+):
+    """
+    One explicit step of the lumped-1D thermal model + cure update.
+
+    Per cell:
+      (rho cp)_eff dT/dt + (rho cp)_resin * phi * gamma * (u . grad T)
+            = -2 h_tool / h_thk * (T - T_tool)            (1D sink)
+              + gamma * phi * rho_resin * H_total * dα/dt (cure source)
+
+    Tool sink is integrated implicitly per cell to allow large dt.
+    Convection is upwind on the resin-bearing fraction (gamma weighted).
+    In-plane conduction is omitted in this first attempt (negligible for
+    thin shells; can be added by symmetry with the pressure-gradient
+    block in _step_jit).
+    """
+    N = T.size
+    K = nbrs.shape[1]
+    T_new = T.copy()
+    a_new = alpha.copy()
+
+    for i in range(N):
+        cti = ct[i]
+        if cti != 1 and cti != -3:
+            continue
+
+        h_thk = thickness[i]
+        phi = porosity[i]
+        g_i = gamma_vof[i]
+
+        # Effective volumetric heat capacity. Resin contribution is
+        # weighted by gamma so dry preform sees only fiber thermal mass.
+        rcp_resin = phi * g_i * rho_resin * cp_resin
+        rcp_fiber = (1.0 - phi) * rho_fiber * cp_fiber
+        rcp = rcp_resin + rcp_fiber
+        if rcp < 1e-12:
+            continue
+
+        # --- Convective term in NON-CONSERVATIVE form ---
+        # rcp_resin * g * (u . grad T) is discretised as a sum over faces of
+        # rho*cp * g_face * ndu * (T_face - T_i) * A / vol. This vanishes
+        # identically when T is uniform, which is the correct behaviour
+        # for compressible LCM filling where (rho cp)_eff does not track
+        # the changing resin mass during the step.
+        F_T = 0.0
+        for k in range(K):
+            j = nbrs[i, k]
+            if j < 0:
+                break
+            u_j = T11[i, k] * u[j] + T12[i, k] * v[j]
+            v_j = T21[i, k] * u[j] + T22[i, k] * v[j]
+            nx = face_nx[i, k]
+            ny = face_ny[i, k]
+            A = face_area[i, k]
+            u_m = 0.5 * (u[i] + u_j)
+            v_m = 0.5 * (v[i] + v_j)
+            ndu = nx * u_m + ny * v_m
+            ctj = ct[j]
+            if ctj == -2:
+                # outflow: zero-gradient on T → no contribution
+                continue
+            if ctj == -1:
+                # inlet face: only inflow contributes (resin enters carrying T_inlet)
+                if ndu < 0.0:
+                    F_T += rho_resin * cp_resin * 1.0 * ndu * (T[j] - T[i]) * A
+                continue
+            # interior / wall neighbour: upwind T_face, gamma_face
+            if ndu >= 0.0:
+                g_face = g_i
+                T_face = T[i]
+            else:
+                g_face = gamma_vof[j]
+                T_face = T[j]
+            F_T += rho_resin * cp_resin * g_face * ndu * (T_face - T[i]) * A
+
+        vol = volume[i]
+
+        # --- Cure source term ---
+        if cure_on:
+            ai = a_new[i]
+            if ai < 0.0:
+                ai = 0.0
+            if ai > 1.0:
+                ai = 1.0
+            Ti = T[i]
+            if Ti < 1.0:
+                Ti = 1.0
+            k1 = A1 * np.exp(-E1 / (R_GAS * Ti))
+            k2 = A2 * np.exp(-E2 / (R_GAS * Ti))
+            da_dt = (k1 + k2 * ai ** m_kin) * (1.0 - ai) ** n_kin
+            # Cap step to avoid runaway
+            da = da_dt * dt
+            if da > 0.05:
+                da = 0.05
+            a_new[i] = ai + da
+            if a_new[i] > 1.0:
+                a_new[i] = 1.0
+            S_cure = g_i * phi * rho_resin * H_total * (da / dt)
+        else:
+            S_cure = 0.0
+
+        # --- Tool sink + convection + source, implicit on the sink ---
+        # rcp * (T_new - T) / dt = -F_T/vol - 2 h/h_thk*(T_new - T_tool) + S
+        # => T_new (rcp/dt + 2h/h_thk) = rcp/dt * T - F_T/vol
+        #                              + 2h/h_thk * T_tool + S
+        sink = 2.0 * h_tool / max(h_thk, 1e-9)
+        lhs = rcp / dt + sink
+        rhs = (rcp / dt) * T[i] - F_T / vol + sink * T_tool + S_cure
+        T_new[i] = rhs / lhs
+
+    # BC: pin inlet cells; outlet/wall handled by skip + flux logic
+    for i in range(N):
+        if ct[i] == -1:
+            T_new[i] = T[i]      # inlet T already set externally
+            a_new[i] = alpha[i]  # inlet alpha pinned
+
+    for i in range(N):
+        T[i] = T_new[i]
+        alpha[i] = a_new[i]
+
+
 def _setup_eos_model1(params, p_a, p_init):
     """Compressible-air EOS lookup-table coefficients and inlet/init densities."""
     kappa = params.p_ref / (params.rho_ref ** params.gamma)
@@ -1088,6 +1346,24 @@ def run_filling(mesh, params, on_snapshot=None):
         phi_new = phi_target_init.copy()
         perm_factor = phi_p_init ** 3 / (1.0 - phi_p_init) ** 2
 
+    # ---- thermal / cure state ----
+    thermal_on = bool(params.thermal_enabled)
+    cure_on = bool(params.cure_enabled)
+    if thermal_on:
+        T_field = np.full(N, params.T_init, dtype=np.float64)
+        T_field[celltype == CELL_INLET] = params.T_inlet
+        alpha_field = np.full(N, params.alpha_init, dtype=np.float64)
+        # Refresh viscosity from the initial (T, alpha) so the CFL below
+        # uses a consistent mu_min instead of params.mu_resin.
+        viscosity = _viscosity_TA(
+            T_field, alpha_field,
+            params.mu_inf, params.E_mu, params.alpha_gel,
+            params.C1_visc, params.C2_visc, params.mu_max, cure_on,
+        )
+    else:
+        T_field = np.empty(0)
+        alpha_field = np.empty(0)
+
     # ---- initial dt (CFL on Darcy-driven max velocity) ----
     area_min = float(np.min(geom.volume / thickness))
     h_min = np.sqrt(area_min)
@@ -1098,6 +1374,16 @@ def run_filling(mesh, params, on_snapshot=None):
     mu_min = float(np.min(viscosity))
     u_max = K_eff_max * dp / (mu_min * h_min) + 1e-30
     dt = params.cfl * betat2_fac * h_min / u_max
+    # Thermal stability cap: dt <= cp_eff * h_thk / (2 * h_tool) keeps the
+    # implicit Newton-cooling step well-conditioned even though it's
+    # unconditionally stable. Convective CFL on T is already covered by
+    # the flow CFL since T is advected with u.
+    if thermal_on and params.h_tool > 0:
+        h_thk_min = float(np.min(thickness))
+        rcp_min = (params.rho_resin * params.cp_resin
+                   if params.rho_resin > 0 else 1.0e6)
+        dt_therm = 0.5 * rcp_min * h_thk_min / (2.0 * params.h_tool + 1e-30)
+        dt = min(dt, dt_therm)
 
     n_pics = max(4, (params.n_pics // 4) * 4)
     t_max = max(params.tmax, n_pics * dt)
@@ -1133,6 +1419,10 @@ def run_filling(mesh, params, on_snapshot=None):
             snap = Snapshot(step=step, t=t, gamma=gamma_vof.copy(),
                             p=p.copy(), celltype=celltype.copy(),
                             p_offset=p_offset)
+        if thermal_on:
+            snap.T = T_field.copy()
+            snap.alpha = alpha_field.copy()
+            snap.mu = viscosity.copy()
         snapshots.append(snap)
         if on_snapshot is not None:
             on_snapshot(snap)
@@ -1153,6 +1443,9 @@ def run_filling(mesh, params, on_snapshot=None):
         gamma_vof[cids] = 1.0
         u[cids] = 0.0
         v[cids] = 0.0
+        if thermal_on:
+            T_field[cids] = params.T_inlet
+            alpha_field[cids] = params.alpha_init
 
     take_snapshot(0, 0.0)
     t_next = dt_snap
@@ -1173,6 +1466,15 @@ def run_filling(mesh, params, on_snapshot=None):
             # 1% relaxation, matches Julia LCMsim
             phi_new[:] = phi_old + 0.01 * (phi_target - phi_old)
 
+        # Refresh viscosity from current (T, alpha) before the flow step
+        # so Darcy drag sees the temperature/cure-shifted mu.
+        if thermal_on:
+            viscosity = _viscosity_TA(
+                T_field, alpha_field,
+                params.mu_inf, params.E_mu, params.alpha_gel,
+                params.C1_visc, params.C2_visc, params.mu_max, cure_on,
+            )
+
         _step_jit(
             params.i_model,
             geom.celltype, geom.neighbours, geom.volume,
@@ -1188,6 +1490,23 @@ def run_filling(mesh, params, on_snapshot=None):
         )
         if params.i_model == 3:
             phi_old[:] = phi_new
+
+        if thermal_on:
+            _step_thermal_jit(
+                geom.celltype, geom.neighbours, geom.volume,
+                geom.face_nx, geom.face_ny, geom.face_area,
+                geom.T11, geom.T12, geom.T21, geom.T22,
+                thickness, porosity, gamma_vof,
+                params.rho_resin, params.cp_resin,
+                params.rho_fiber, params.cp_fiber,
+                params.h_tool, params.T_tool,
+                cure_on, params.H_total,
+                params.A1_cure, params.A2_cure,
+                params.E1_cure, params.E2_cure,
+                params.m_cure, params.n_cure,
+                u, v, T_field, alpha_field,
+                dt,
+            )
 
         step += 1
         t += dt
