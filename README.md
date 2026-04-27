@@ -21,7 +21,7 @@ Python port of [RTMsim](https://github.com/obertscheiderfhwn/RTMsim) (Christof O
 
 Example:
 
-![alt text](output_annulusfiller/fill_sequence_2d.png)
+![alt text](img/fill_sequence_2d.png)
 
 ## Install and run
 
