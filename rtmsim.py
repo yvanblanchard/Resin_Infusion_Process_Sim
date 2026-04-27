@@ -1,16 +1,24 @@
 """
-RTMsim-Py: Python port of RTMsim (Obertscheider et al., FHWN).
+RTMsim-Py: Python port of RTMsim/LCMsim (Obertscheider et al., FHWN).
 
-Single-file implementation of the Finite Area Method solver for RTM
-filling simulation on triangle shell meshes. Physics: compressible
-Euler + Darcy drag + VOF. Numerics: least-squares gradient + first-
-order upwind flux, explicit Euler for continuity/VOF with implicit
-Darcy drag in the momentum update.
+Finite Area Method solver for LCM filling simulation on triangle shell
+meshes. Three process models are supported:
 
-This port drops GUI, Nastran BDF reader, JLD2 file I/O, and post-
-processing plots from the original package. Meshes are built from
-numpy arrays; up to 4 in-plane patches define inlets, outlets, and
-preform regions with distinct orientations.
+    i_model=1  RTM (resin transfer molding), iso-thermal compressible
+               Euler + Darcy drag + smooth VOF, quadratic-fit EOS.
+    i_model=2  RTM-VARI two-fluid surrogate, hard VOF cutoff, power-
+               law EOS p(rho) mapping rho_air -> p_init, rho_resin
+               -> p_inlet.
+    i_model=3  VARI without flow distribution medium: same EOS as
+               model 2, with pressure-dependent porosity (preform
+               compaction). Per-ply quadratic phi(p) = phi0 + c*p^2;
+               permeability scales by Carman-Kozeny-like factor
+               phi^3/(1-phi)^2.
+
+Meshes are built from numpy arrays. Per-element permeability comes
+from a `LaminateStack` (PCOMP-style: every cell carries the same set
+of plies). Patches mark inlet/outlet regions only; the stack supplies
+all material/orientation data.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -36,11 +44,12 @@ CELL_WALL = -3
 # --------------------------------------------------------------------------
 @dataclass
 class PatchProperties:
+    """
+    Marker for an inlet/outlet patch. Carries only a thickness fallback
+    used when scaling boundary face areas. Fibre orientation, in-plane
+    permeability, and porosity are now owned exclusively by the stack.
+    """
     thickness: float = 3e-3
-    porosity: float = 0.7
-    K1: float = 3e-10
-    alpha: float = 1.0
-    refdir: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0]))
 
 
 @dataclass
@@ -48,10 +57,19 @@ class PlyProperties:
     """
     One ply in a stacked-laminate (PCOMP) element.
 
-    Each ply has its own thickness, in-plane principal permeabilities
-    (K1 along the fibre, K2 across), and a global-frame fibre direction.
-    Porosity is per-ply because different fabrics in the stack can have
-    different fibre volume fractions.
+    Per-ply: thickness, in-plane principal permeabilities (K1 along the
+    fibre, K2 across), global-frame fibre direction, baseline porosity.
+
+    For i_model=3 (VARI compactable preform) two extra parameters define
+    the quadratic porosity-vs-pressure law:
+
+        phi(p) = porosity + c * p^2,
+        c      = (porosity_at_p1 - porosity) / p1^2
+
+    porosity_at_p1 should be the measured / specified porosity at
+    pressure p1 (typically the injection pressure). The default makes
+    the law a no-op (porosity_at_p1 == porosity), so non-LCM users get
+    constant porosity.
     """
     thickness: float = 0.75e-3
     porosity: float = 0.7
@@ -59,6 +77,14 @@ class PlyProperties:
     K2: float = 0.6e-10
     refdir: np.ndarray = field(
         default_factory=lambda: np.array([1.0, 0.0, 0.0]))
+    porosity_at_p1: float = 0.7
+    p1: float = 1.0e5
+
+    @property
+    def porosity_quadratic_c(self) -> float:
+        if self.p1 <= 0:
+            return 0.0
+        return (self.porosity_at_p1 - self.porosity) / (self.p1 * self.p1)
 
 
 @dataclass
@@ -72,9 +98,13 @@ class LaminateStack:
     element frame and summed thickness-weighted across plies. The
     result is a single 2x2 tensor per element.
 
-    This is the standard LCM PCOMP shell assumption: same in-plane
-    pressure gradient across all plies (parallel flow), so flow rate
-    adds — equivalent to thickness-weighted tensor averaging.
+    Standard LCM PCOMP shell assumption: same in-plane pressure
+    gradient across all plies (parallel flow), so flow rates add —
+    equivalent to thickness-weighted tensor averaging.
+
+    For i_model=3 the quadratic porosity coefficient c is also linear
+    in stack averaging, so per-element phi(p) is a single quadratic
+    phi_eff(p) = phi0_eff + c_eff * p^2.
     """
     plies: list = field(default_factory=list)
 
@@ -84,44 +114,90 @@ class LaminateStack:
 
     @property
     def effective_porosity(self) -> float:
-        """Volume-weighted porosity: sum(phi_p * t_p) / sum(t_p)."""
         t = self.total_thickness
         if t == 0:
             return 0.0
         return float(sum(p.porosity * p.thickness for p in self.plies) / t)
 
+    @property
+    def effective_c_porosity(self) -> float:
+        """Thickness-weighted c-coefficient for phi_eff(p) = phi0 + c*p^2."""
+        t = self.total_thickness
+        if t == 0:
+            return 0.0
+        return float(sum(p.porosity_quadratic_c * p.thickness
+                         for p in self.plies) / t)
+
 
 @dataclass
 class SimParameters:
-    i_model: int = 1
+    # --- model selection ---
+    i_model: int = 1                 # 1=RTM, 2=RTM-VARI, 3=VARI compactable
+
+    # --- run control ---
     tmax: float = 200.0
+    n_pics: int = 16
+    max_neighbours: int = 10
+    gradient_method: int = 3
+    cfl: float = 0.05
+
+    # --- fluid / EOS (i_model=1) ---
     p_ref: float = 1.01325e5
     rho_ref: float = 1.225
     gamma: float = 1.4
     mu_resin: float = 0.06
     p_inlet: float = 1.35e5
     p_init: float = 1.0e5
-    main: PatchProperties = field(default_factory=PatchProperties)
+
+    # --- two-fluid EOS (i_model=2,3) ---
+    rho_air: float = 1.225
+    rho_resin: float = 960.0
+    # Power-law exponent in p(rho). 4 for normal preforms; auto-bumped
+    # to 25 when the in-plane permeability ratio exceeds 100
+    # (race-tracking suppression). Set to a positive int to override.
+    exp_eos: int = 0                 # 0 == auto
+
+    # --- patches (inlet / outlet markers only) ---
     patches: List[PatchProperties] = field(
         default_factory=lambda: [PatchProperties() for _ in range(4)])
     patch_types: List[int] = field(
         default_factory=lambda: [PATCH_INLET, PATCH_IGNORE, PATCH_IGNORE, PATCH_IGNORE])
-    n_pics: int = 16
-    max_neighbours: int = 10
-    gradient_method: int = 3
-    cfl: float = 0.05
-    # If provided, this stack overrides PatchProperties for permeability:
-    # every element gets the same stack, and per-element permeability is
-    # the thickness-weighted sum of rotated ply tensors.
+
+    # --- preform (required) ---
+    # Stack must be set; supplies per-element K, porosity, and thickness.
     stack: object = None
 
+    # --- cascade injection ---
+    # Each event is a (t_activate, cell_ids) tuple. At simulation time
+    # t_activate the listed cells are flipped to CELL_INLET and pinned at
+    # inlet rho/p/gamma for the rest of the run, modelling a delayed
+    # secondary injection port.
+    cascade_events: list = field(default_factory=list)
+
     def validate(self):
-        if self.i_model != 1:
-            raise ValueError("Only i_model=1 is implemented")
+        if self.i_model not in (1, 2, 3):
+            raise ValueError("i_model must be 1, 2, or 3")
         if self.tmax <= 0:
             raise ValueError("tmax must be > 0")
         if self.p_inlet <= self.p_init:
             raise ValueError("p_inlet must be > p_init")
+        if self.stack is None or not getattr(self.stack, "plies", None):
+            raise ValueError("A LaminateStack with plies is required")
+        if self.i_model == 3:
+            # Sanity-check the porosity quadratic at the operating
+            # pressure: if phi(p_inlet) > 0.9 the preform is essentially
+            # decompacted, the Carman-Kozeny-like factor phi^3/(1-phi)^2
+            # diverges (>= ~73 already at phi=0.9), and dt has to
+            # collapse to keep the solver stable. Tell the user instead.
+            for k, ply in enumerate(self.stack.plies):
+                ap = ply.porosity
+                cp = ply.porosity_quadratic_c
+                phi_at_inlet = ap + cp * (self.p_inlet ** 2)
+                if phi_at_inlet > 0.9:
+                    raise ValueError(
+                        f"i_model=3: ply {k} porosity at p_inlet="
+                        f"{self.p_inlet:.0f} Pa is {phi_at_inlet:.3f} "
+                        f"(> 0.9). Reduce porosity_at_p1 or increase p1.")
 
 
 @dataclass
@@ -157,6 +233,53 @@ class Snapshot:
     gamma: np.ndarray
     p: np.ndarray
     celltype: np.ndarray
+    # i_model=3: per-cell instantaneous porosity / compacted thickness
+    porosity: np.ndarray = None
+    thickness: np.ndarray = None
+    # Absolute-pressure offset baked in by the solver:
+    #   p_absolute = p + p_offset
+    # i_model=1 runs in normalized pressure (origin at p_eps), so this
+    # offset is (p_init - p_eps); for i_model=2/3 the stored p is
+    # already absolute and the offset is 0.
+    p_offset: float = 0.0
+
+
+def pressure_absolute(snap):
+    """Per-cell absolute pressure (Pa) for any model."""
+    return snap.p + snap.p_offset
+
+
+def pressure_results(snaps):
+    """
+    Bundle of pressure analysis results across all snapshots.
+
+    Returns a dict with:
+      times     (n_snap,)            time of each snapshot [s]
+      p         (n_snap, n_cells)    absolute pressure per cell [Pa]
+      p_min     (n_snap,)            min absolute pressure (fluid cells)
+      p_max     (n_snap,)            max absolute pressure (fluid cells)
+      p_mean    (n_snap,)            unweighted mean over fluid cells
+      celltype  (n_snap, n_cells)    cell-type tag per snapshot
+    Fluid cells are interior + wall (excludes inlet/outlet so the
+    imposed-pressure boundary doesn't dominate stats).
+    """
+    times = np.array([s.t for s in snaps], dtype=np.float64)
+    p_stack = np.array([pressure_absolute(s) for s in snaps], dtype=np.float64)
+    ct_stack = np.array([s.celltype for s in snaps])
+    p_min = np.empty(len(snaps))
+    p_max = np.empty(len(snaps))
+    p_mean = np.empty(len(snaps))
+    for k, s in enumerate(snaps):
+        fluid = (s.celltype == CELL_INTERIOR) | (s.celltype == CELL_WALL)
+        if not fluid.any():
+            p_min[k] = p_max[k] = p_mean[k] = np.nan
+            continue
+        pa = pressure_absolute(s)[fluid]
+        p_min[k] = pa.min()
+        p_max[k] = pa.max()
+        p_mean[k] = pa.mean()
+    return dict(times=times, p=p_stack, celltype=ct_stack,
+                p_min=p_min, p_max=p_max, p_mean=p_mean)
 
 
 # --------------------------------------------------------------------------
@@ -264,11 +387,12 @@ def _unit(v):
 
 def assign_parameters(mesh, params, celltype):
     """
-    Overlay patch types / scalar properties on each cell.
+    Tag inlet/outlet cells from patch ids; build per-cell scalar arrays.
 
-    Note: when params.stack is provided, the per-element permeability
-    and refdir returned here are placeholders only. The real per-element
-    tensor is computed by build_stack_tensor() later.
+    All preform properties (thickness, porosity, K) come from the stack.
+    Patches only mark inlet (PATCH_INLET) and outlet (PATCH_OUTLET)
+    cells. PATCH_PREFORM is accepted but treated as IGNORE — the stack
+    already covers every element.
     """
     N = mesh.N
     ct = celltype.copy()
@@ -280,48 +404,23 @@ def assign_parameters(mesh, params, celltype):
         elif t == PATCH_OUTLET:
             ct[cells] = CELL_OUTLET
 
-    if params.stack is not None:
-        # Stacked-laminate mode: one stack covers every element. Use
-        # total stack thickness and effective porosity for all cells.
-        t_tot = params.stack.total_thickness
-        phi_eff = params.stack.effective_porosity
-        thickness = np.full(N, t_tot)
-        porosity  = np.full(N, phi_eff)
-        # `perm` and `alpha` are unused in stack mode (the solver reads
-        # K_eff arrays instead). Keep harmless placeholders.
-        perm  = np.full(N, params.stack.plies[0].K1 if params.stack.plies else 1e-10)
-        alpha = np.ones(N)
-        # refdir is also unused in stack mode but the coord-system
-        # builder still reads it. Use +x; with theta_used=0 below,
-        # this has no effect on the local frame.
-        refdir = np.tile(np.array([1.0, 0.0, 0.0]), (N, 1))
-        viscosity = np.full(N, params.mu_resin)
-        return ct, thickness, porosity, perm, alpha, refdir, viscosity
-
-    # Legacy patch-based mode
-    thickness = np.full(N, params.main.thickness)
-    porosity  = np.full(N, params.main.porosity)
-    perm      = np.full(N, params.main.K1)
-    alpha     = np.full(N, params.main.alpha)
-    refdir    = np.tile(_unit(params.main.refdir), (N, 1))
+    stack = params.stack
+    t_tot = stack.total_thickness
+    phi_eff = stack.effective_porosity
+    thickness = np.full(N, t_tot)
+    porosity  = np.full(N, phi_eff)
     viscosity = np.full(N, params.mu_resin)
-    for pi in range(4):
-        if params.patch_types[pi] != PATCH_PREFORM:
-            continue
-        cells = mesh.patch_cell_ids[pi]
-        if cells.size == 0:
-            continue
-        pp = params.patches[pi]
-        thickness[cells] = pp.thickness
-        porosity[cells]  = pp.porosity
-        perm[cells]      = pp.K1
-        alpha[cells]     = pp.alpha
-        refdir[cells]    = _unit(pp.refdir)
-    return ct, thickness, porosity, perm, alpha, refdir, viscosity
+    return ct, thickness, porosity, viscosity
 
 
-def create_coordinate_systems(mesh, neighbours, celltype, thickness, refdir, max_neighbours, use_theta=True):
-    """Per-cell basis aligned with projected refdir; flattened neighbour geometry."""
+def create_coordinate_systems(mesh, neighbours, celltype, thickness, max_neighbours):
+    """Per-cell geometric basis from triangle nodes; flattened neighbour geometry.
+
+    Local frame is purely geometric (no fibre rotation): e1 along the
+    first triangle edge, e2 perpendicular in-plane, e3 = e1 x e2. The
+    per-element K tensor (built by build_stack_tensor) is expressed in
+    this frame, so no rotation by a single per-cell theta is needed.
+    """
     N = mesh.N
     K = max_neighbours
     nodes = mesh.nodes
@@ -342,12 +441,7 @@ def create_coordinate_systems(mesh, neighbours, celltype, thickness, refdir, max
         e2 = a2 - np.dot(e1, a2) * e1
         e2 /= np.linalg.norm(e2)
         e3 = np.cross(e1, e2)
-        Tm = np.column_stack([e1, e2, e3])
-        if use_theta:
-            r_loc = np.linalg.solve(Tm, refdir[ind])
-            th = np.arctan2(r_loc[1], r_loc[0])
-        else:
-            th = 0.0
+        th = 0.0
         theta[ind] = th
         c_th, s_th = np.cos(th), np.sin(th)
         b1[ind] =  c_th * e1 + s_th * e2
@@ -452,21 +546,22 @@ def create_coordinate_systems(mesh, neighbours, celltype, thickness, refdir, max
         face_nx=face_nx, face_ny=face_ny, face_area=face_area,
     )
 
-def build_stack_tensor(mesh, stack, refdir_per_ply_used):
+def build_stack_tensor(mesh, stack):
     """
     Per-element 2x2 in-plane permeability tensor for a stacked laminate.
 
     For each element, build the local geometric frame (e1, e2, e3)
-    from the triangle nodes (same as in create_coordinate_systems with
-    theta=0). For each ply, project its global refdir into that
-    element's tangent plane to get the angle alpha_p in (e1, e2). Then
-    the ply's tensor in the element frame is
+    from the triangle nodes. For each ply, project its global refdir
+    into that element's tangent plane to get the angle in (e1, e2).
+    The ply's tensor in the element frame is
 
         R(alpha_p) . diag(K1_p, K2_p) . R(alpha_p)^T
 
-    The element-effective tensor is the thickness-weighted sum of all
-    ply tensors, divided by total stack thickness. Returns Kxx, Kxy,
-    Kyy arrays (length N).
+    The element-effective tensor is the thickness-weighted sum of ply
+    tensors divided by total stack thickness. Porosity is constant per
+    ply, so phi0_eff and the i_model=3 porosity quadratic coefficient
+    c_eff are also stack averages of per-ply values (independent of
+    element orientation). All four arrays are returned per element.
     """
     N = mesh.N
     nodes = mesh.nodes
@@ -477,6 +572,11 @@ def build_stack_tensor(mesh, stack, refdir_per_ply_used):
     t_tot = stack.total_thickness
     if t_tot <= 0:
         raise ValueError("Stack has zero total thickness")
+
+    phi0_eff = stack.effective_porosity
+    c_eff = stack.effective_c_porosity
+    phi0 = np.full(N, phi0_eff)
+    c_porosity = np.full(N, c_eff)
 
     for ind in range(N):
         i1, i2, i3 = cg[ind]
@@ -496,20 +596,15 @@ def build_stack_tensor(mesh, stack, refdir_per_ply_used):
             if rn == 0:
                 continue
             r = r / rn
-            # project refdir into element tangent plane
             rx = float(r @ e1)
             ry = float(r @ e2)
             mag = (rx * rx + ry * ry) ** 0.5
             if mag < 1e-30:
-                # fibre is normal to element — no in-plane contribution;
-                # default to e1 to avoid NaN
                 rx = 1.0
                 ry = 0.0
             else:
                 rx /= mag
                 ry /= mag
-            # rotation from fibre frame to element frame:
-            # K_elem = R . diag(K1, K2) . R^T  with R = [[c, -s], [s, c]]
             c = rx
             s = ry
             K1p = ply.K1
@@ -526,7 +621,7 @@ def build_stack_tensor(mesh, stack, refdir_per_ply_used):
         Kxy[ind] = Kxy_e / t_tot
         Kyy[ind] = Kyy_e / t_tot
 
-    return Kxx, Kxy, Kyy
+    return Kxx, Kxy, Kyy, phi0, c_porosity
 
 
 
@@ -619,23 +714,34 @@ except ImportError:
 
 @njit(cache=True, fastmath=True)
 def _step_jit(
+    i_model,
     ct, nbrs, volume, cc_to_cc_x, cc_to_cc_y,
     face_nx, face_ny, face_area,
     T11, T12, T21, T22,
-    porosity, Kxx, Kxy, Kyy, viscosity,
+    Kxx_base, Kxy_base, Kyy_base, perm_factor, viscosity,
+    phi_old, phi_new,
     rho, u, v, p, gamma_vof,
-    dt, ap0, ap1, ap2, gradient_method,
+    dt,
+    # i_model=1 EOS
+    ap0, ap1, ap2,
+    # i_model=2,3 EOS
+    p_a_eos, p_init_eos, c_eos, exp_eos, rho_air, rho_resin,
 ):
     """
-    One explicit step with full 2x2 in-plane permeability tensor.
+    One explicit step.
 
-    Per-cell K is given by (Kxx, Kxy, Kyy) in the element local frame.
-    The Darcy drag in the momentum update is treated implicitly as a
-    2x2 system
+    Continuity is written in the unified form
 
-        (rho_n I + dt * mu * K^{-1}) u_n = rho u - dt * F/V - dt * grad p
+        rho_n = rho * phi_old/phi_new - dt * F_rho / (V * phi_new)
 
-    The inlet inflow uses the full tensor:  q = -(K . grad p) / mu.
+    For i_model=1 phi_old = phi_new = 1 -> rho_n = rho - dt*F/V.
+    For i_model=2 phi_old = phi_new = phi (constant) -> rho_n = rho - dt*F/(V*phi).
+    For i_model=3 phi_old, phi_new are the relaxed effective porosity
+                  before/after the step (preform compaction).
+
+    Momentum uses an implicit 2x2 Darcy drag with K = K_base * perm_factor[i].
+    EOS branches by i_model (quadratic table for 1; power-law for 2/3).
+    VOF: continuous flux update for 1; hard cutoff for 2/3.
     """
     N = rho.size
     K = nbrs.shape[1]
@@ -645,6 +751,7 @@ def _step_jit(
     v_new = v.copy()
     p_new = p.copy()
     g_new = gamma_vof.copy()
+    rho_thresh = 0.5 * rho_resin
 
     for i in range(N):
         cti = ct[i]
@@ -691,9 +798,10 @@ def _step_jit(
         F_g = 0.0
         F_g1 = 0.0
 
-        kxx = Kxx[i]
-        kxy = Kxy[i]
-        kyy = Kyy[i]
+        pf = perm_factor[i]
+        kxx = Kxx_base[i] * pf
+        kxy = Kxy_base[i] * pf
+        kyy = Kyy_base[i] * pf
         mu = viscosity[i]
 
         for k in range(K):
@@ -754,8 +862,10 @@ def _step_jit(
 
         vol = volume[i]
 
-        # --- Continuity ---
-        rn = rho[i] - dt * F_rho / vol
+        # --- Continuity (unified form across models) ---
+        pn = phi_new[i]
+        po = phi_old[i]
+        rn = (rho[i] * po - dt * F_rho / vol) / pn
         if rn < 0.0:
             rn = 0.0
         rho_new[i] = rn
@@ -788,16 +898,38 @@ def _step_jit(
             u_new[i] = ( Myy * rhs_u - Mxy * rhs_v) * inv_dM
             v_new[i] = (-Mxy * rhs_u + Mxx * rhs_v) * inv_dM
 
-        phi = porosity[i]
-        g_raw = (phi * gamma_vof[i]
-                 - dt * (F_g - gamma_vof[i] * F_g1) / vol) / phi
-        if g_raw < 0.0:
-            g_raw = 0.0
-        if g_raw > 1.0:
-            g_raw = 1.0
-        g_new[i] = g_raw
-
-        p_new[i] = ap0 * rn * rn + ap1 * rn + ap2
+        # --- VOF and EOS ---
+        if i_model == 1:
+            g_raw = (pn * gamma_vof[i]
+                     - dt * (F_g - gamma_vof[i] * F_g1) / vol) / pn
+            if g_raw < 0.0:
+                g_raw = 0.0
+            if g_raw > 1.0:
+                g_raw = 1.0
+            g_new[i] = g_raw
+            p_new[i] = ap0 * rn * rn + ap1 * rn + ap2
+        else:
+            # Hard VOF cutoff for two-fluid surrogate models
+            g_new[i] = 1.0 if rn >= rho_thresh else 0.0
+            # Power-law EOS, with d_rho clamped to (rho_resin - rho_air)
+            # to keep the (potentially overshooting) transient rho from
+            # blowing up float64 in d_rho**exp_eos. The result is
+            # capped to p_a anyway, so clamping d_rho first is a
+            # consistent, overflow-safe rewriting of the same EOS.
+            d_rho = rn - rho_air
+            drho_max = rho_resin - rho_air
+            if d_rho < 0.0:
+                pwr = 0.0
+            elif d_rho > drho_max:
+                pwr = drho_max ** exp_eos
+            else:
+                pwr = d_rho ** exp_eos
+            pp = p_init_eos + c_eos * pwr
+            if pp < p_init_eos:
+                pp = p_init_eos
+            if pp > p_a_eos:
+                pp = p_a_eos
+            p_new[i] = pp
 
     for i in range(N):
         cti = ct[i]
@@ -822,7 +954,8 @@ def _step_jit(
         gamma_vof[i] = g_new[i]
 
 
-def _setup_eos(params, p_a, p_init):
+def _setup_eos_model1(params, p_a, p_init):
+    """Compressible-air EOS lookup-table coefficients and inlet/init densities."""
     kappa = params.p_ref / (params.rho_ref ** params.gamma)
     p_int = np.array([0.0, 0.5e5, 1.0e5])
     rho_int = (p_int / kappa) ** (1.0 / params.gamma)
@@ -830,7 +963,20 @@ def _setup_eos(params, p_a, p_init):
     ap = np.linalg.solve(A, p_int)
     rho_a = (p_a / kappa) ** (1.0 / params.gamma)
     rho_init = (p_init / kappa) ** (1.0 / params.gamma)
-    return kappa, ap, rho_a, rho_init
+    return ap, rho_a, rho_init
+
+
+def _setup_eos_model23(params, exp_eos):
+    """Two-fluid surrogate p(rho) = p_init + c*(rho-rho_air)^exp_eos.
+
+    p_a, p_init are the absolute pressures (not normalized).
+    Returns (c_eos, rho_a, rho_init).
+    """
+    p_a = params.p_inlet
+    p_init = params.p_init
+    drho = params.rho_resin - params.rho_air
+    c = (p_a - p_init) / (drho ** exp_eos)
+    return c, params.rho_resin, params.rho_air
 
 
 def _initial_conditions(N, celltype, rho_a, rho_init, p_a, p_init):
@@ -850,96 +996,9 @@ def _initial_conditions(N, celltype, rho_a, rho_init, p_a, p_init):
     return rho, u, v, p, gamma_vof
 
 
-def _step(geom, porosity, perm, alpha, viscosity,
-          rho, u, v, p, gamma_vof, dt, ap, gradient_method):
-    N = rho.size
-    ct = geom.celltype
-    rho_new = rho.copy()
-    u_new = u.copy()
-    v_new = v.copy()
-    p_new = p.copy()
-    gamma_new = gamma_vof.copy()
-    nbrs = geom.neighbours
-    cc_to_cc_x = geom.cc_to_cc_x
-    cc_to_cc_y = geom.cc_to_cc_y
-    face_nx = geom.face_nx
-    face_ny = geom.face_ny
-    face_area = geom.face_area
-    T11 = geom.T11
-    T12 = geom.T12
-    T21 = geom.T21
-    T22 = geom.T22
-    for i in range(N):
-        if ct[i] != CELL_INTERIOR and ct[i] != CELL_WALL:
-            continue
-        dpdx, dpdy = numerical_gradient(gradient_method, i, p, nbrs, cc_to_cc_x, cc_to_cc_y)
-        F_rho = 0.0
-        F_u = 0.0
-        F_v = 0.0
-        F_g = 0.0
-        F_g1 = 0.0
-        row_nb = nbrs[i]
-        for k in range(row_nb.size):
-            j = row_nb[k]
-            if j < 0:
-                break
-            u_j = T11[i, k] * u[j] + T12[i, k] * v[j]
-            v_j = T21[i, k] * u[j] + T22[i, k] * v[j]
-            nx = face_nx[i, k]
-            ny = face_ny[i, k]
-            A = face_area[i, k]
-            if ct[j] == CELL_INTERIOR or ct[j] == CELL_WALL:
-                fR, fU, fV, fG, fG1 = flux_interior(
-                    rho[i], u[i], v[i], gamma_vof[i],
-                    rho[j], u_j, v_j, gamma_vof[j], nx, ny, A)
-            else:
-                if ct[j] == CELL_OUTLET:
-                    n_dot_u = nx * u[i] + ny * v[i]
-                else:
-                    K1 = perm[i]
-                    K2 = alpha[i] * perm[i]
-                    mu = viscosity[i]
-                    qx = -K1 / mu * dpdx
-                    qy = -K2 / mu * dpdy
-                    n_dot_u = min(0.0, nx * qx + ny * qy)
-                fR, fU, fV, fG, fG1 = flux_boundary(
-                    rho[i], u[i], v[i], gamma_vof[i],
-                    rho[j], u[j], v[j], gamma_vof[j], nx, ny, A, n_dot_u)
-            F_rho += fR
-            F_u += fU
-            F_v += fV
-            F_g += fG
-            F_g1 += fG1
-        vol = geom.volume[i]
-        rho_new[i] = max(0.0, rho[i] - dt * F_rho / vol)
-        mu = viscosity[i]
-        K1 = perm[i]
-        K2 = alpha[i] * K1
-        denom_u = rho_new[i] + mu / K1 * dt
-        denom_v = rho_new[i] + mu / K2 * dt
-        u_new[i] = (rho[i] * u[i] - dt * F_u / vol - dt * dpdx) / denom_u
-        v_new[i] = (rho[i] * v[i] - dt * F_v / vol - dt * dpdy) / denom_v
-        phi = porosity[i]
-        gamma_new[i] = (phi * gamma_vof[i] - dt * (F_g - gamma_vof[i] * F_g1) / vol) / phi
-        gamma_new[i] = min(1.0, max(0.0, gamma_new[i]))
-        p_new[i] = ap[0] * rho_new[i] ** 2 + ap[1] * rho_new[i] + ap[2]
-    inlet = ct == CELL_INLET
-    outlet = ct == CELL_OUTLET
-    rho_new[inlet] = rho[inlet]
-    p_new[inlet] = p[inlet]
-    gamma_new[inlet] = 1.0
-    u_new[inlet] = 0.0
-    v_new[inlet] = 0.0
-    rho_new[outlet] = rho[outlet]
-    p_new[outlet] = p[outlet]
-    gamma_new[outlet] = 0.0
-    u_new[outlet] = 0.0
-    v_new[outlet] = 0.0
-    rho[:] = rho_new
-    u[:] = u_new
-    v[:] = v_new
-    p[:] = p_new
-    gamma_vof[:] = gamma_new
+def _eigmax_K(Kxx, Kxy, Kyy):
+    diff = Kxx - Kyy
+    return 0.5 * (Kxx + Kyy + np.sqrt(diff * diff + 4.0 * Kxy * Kxy))
 
 
 def run_filling(mesh, params, on_snapshot=None):
@@ -947,105 +1006,197 @@ def run_filling(mesh, params, on_snapshot=None):
     Main driver. Returns list of Snapshot objects; calls
     on_snapshot(snap) after each snapshot if provided.
 
-    Two operating modes:
+    Three model branches share the same JIT kernel; per-cell arrays
+    are precomputed here so the kernel sees a uniform interface:
 
-    * Patch mode (default): per-element diagonal K = diag(K1, alpha*K1)
-      aligned with the patch refdir. Each element gets one fibre angle
-      from the patch it belongs to.
-
-    * Stack mode (params.stack is a LaminateStack): the laminate is
-      stacked through the thickness. Every element carries every ply,
-      and per-element K_eff is the thickness-weighted sum of rotated
-      ply tensors
-
-          K_eff(i) = (1/t_tot) sum_p R(theta_p,i) diag(K1_p, K2_p) R^T t_p
-
-      expressed in the element's geometric local frame. Only the per-
-      ply refdir varies between plies; thickness, K1, K2, porosity may
-      also vary per ply.
+      * Kxx_base, Kxy_base, Kyy_base : per-element K from build_stack_tensor
+      * perm_factor[i]               : 1.0 for models 1/2; phi^3/(1-phi)^2 for 3
+      * phi_old[i], phi_new[i]       : 1.0 (model 1); phi (model 2);
+                                       relaxed effective porosity (model 3)
+      * EOS scalars                  : ap0/ap1/ap2 (model 1) and
+                                       p_a/p_init/c/exp/rho_air/rho_resin (2,3)
     """
     params.validate()
     neighbours, celltype = create_faces(mesh, params.max_neighbours)
-    celltype, thickness, porosity, perm, alpha, refdir, viscosity = \
+    celltype, thickness, porosity, viscosity = \
         assign_parameters(mesh, params, celltype)
 
-    # In stack mode the per-element local frame is purely geometric.
-    use_theta = (params.stack is None)
     geom = create_coordinate_systems(
-        mesh, neighbours, celltype, thickness, refdir, params.max_neighbours,
-        use_theta=use_theta,
+        mesh, neighbours, celltype, thickness, params.max_neighbours,
     )
 
-    # Build the per-element K tensor consumed by _step_jit.
-    if params.stack is not None:
-        Kxx, Kxy, Kyy = build_stack_tensor(mesh, params.stack, refdir)
-    else:
-        # Diagonal in element local frame: K = diag(K1, alpha*K1).
-        Kxx = perm.copy()
-        Kyy = perm * alpha
-        Kxy = np.zeros_like(perm)
+    Kxx_base, Kxy_base, Kyy_base, phi0, c_porosity = \
+        build_stack_tensor(mesh, params.stack)
 
     N = mesh.N
     if not (celltype == CELL_INLET).any():
         raise RuntimeError("No inlet cells defined")
 
-    # Pressure normalization for EOS table stability.
-    p_eps = 100.0
-    p_a = params.p_inlet - params.p_init + p_eps
-    p_init = p_eps
-    kappa, ap, rho_a, rho_init = _setup_eos(params, p_a, p_init)
-    rho, u, v, p, gamma_vof = _initial_conditions(
-        N, celltype, rho_a, rho_init, p_a, p_init)
+    # ---- choose EOS exponent (auto-bump for race-tracking) ----
+    K_eig = _eigmax_K(Kxx_base, Kxy_base, Kyy_base)
+    K_max = float(np.max(K_eig))
+    K_min = float(np.min(K_eig[K_eig > 0])) if np.any(K_eig > 0) else K_max
+    perm_ratio = K_max / max(K_min, 1e-30)
+    if params.exp_eos > 0:
+        exp_eos = int(params.exp_eos)
+    else:
+        exp_eos = 25 if perm_ratio >= 100.0 else 4
+    betat2_fac = 0.1 if perm_ratio >= 100.0 else 1.0
 
-    # Initial dt: use the largest eigenvalue of K_eff as effective
-    # permeability. For a 2x2 symmetric tensor lambda1 = (kxx+kyy +
-    # sqrt((kxx-kyy)^2 + 4 kxy^2)) / 2.
+    # ---- pressure normalization & EOS coefficients ----
+    if params.i_model == 1:
+        p_eps = 100.0
+        p_a = params.p_inlet - params.p_init + p_eps
+        p_init_run = p_eps
+        ap, rho_a, rho_init = _setup_eos_model1(params, p_a, p_init_run)
+        ap0, ap1, ap2 = float(ap[0]), float(ap[1]), float(ap[2])
+        c_eos = 0.0
+        p_a_eos = p_a
+        p_init_eos = p_init_run
+        rho_air_param = params.rho_air
+        rho_resin_param = params.rho_resin
+    else:
+        # i_model 2 or 3: use absolute pressures, two-fluid EOS
+        p_a = params.p_inlet
+        p_init_run = params.p_init
+        c_eos, rho_a, rho_init = _setup_eos_model23(params, exp_eos)
+        ap0 = ap1 = ap2 = 0.0
+        p_a_eos = p_a
+        p_init_eos = p_init_run
+        rho_air_param = params.rho_air
+        rho_resin_param = params.rho_resin
+
+    rho, u, v, p, gamma_vof = _initial_conditions(
+        N, celltype, rho_a, rho_init, p_a, p_init_run)
+
+    # ---- per-cell porosity / perm-factor scratch arrays ----
+    if params.i_model == 1:
+        phi_old = np.ones(N)
+        phi_new = np.ones(N)
+        perm_factor = np.ones(N)
+    elif params.i_model == 2:
+        phi_old = porosity.copy()
+        phi_new = porosity.copy()
+        perm_factor = np.ones(N)
+    else:  # i_model == 3
+        # Initialize phi_eff_old to the volume-conserving target evaluated
+        # at the initial pressure. For all interior cells p == p_init,
+        # so phi_p == phi0 + c*p_init^2 (small perturbation).
+        phi_p_init = np.clip(phi0 + c_porosity * p_init_run ** 2, 1e-6, 0.999)
+        phi_target_init = (1.0 - phi0) / (1.0 - phi_p_init) * phi_p_init
+        phi_old = phi_target_init.copy()
+        phi_new = phi_target_init.copy()
+        perm_factor = phi_p_init ** 3 / (1.0 - phi_p_init) ** 2
+
+    # ---- initial dt (CFL on Darcy-driven max velocity) ----
     area_min = float(np.min(geom.volume / thickness))
     h_min = np.sqrt(area_min)
-    dp = params.p_inlet - params.p_init
-    diff = Kxx - Kyy
-    lam1 = 0.5 * (Kxx + Kyy + np.sqrt(diff * diff + 4.0 * Kxy * Kxy))
-    K_eff = float(np.max(lam1))
+    dp = p_a - p_init_run
+    K_eff_max = K_max  # eigmax already reflects in-plane stack tensor
+    if params.i_model == 3:
+        K_eff_max *= float(np.max(perm_factor))
     mu_min = float(np.min(viscosity))
-    u_max = K_eff * dp / (mu_min * h_min) + 1e-30
-    dt = params.cfl * h_min / u_max
-    dt0 = dt
+    u_max = K_eff_max * dp / (mu_min * h_min) + 1e-30
+    dt = params.cfl * betat2_fac * h_min / u_max
 
     n_pics = max(4, (params.n_pics // 4) * 4)
     t_max = max(params.tmax, n_pics * dt)
     dt_snap = t_max / n_pics
+    # Absolute dt cap: at least 40 steps per snapshot interval. Two-
+    # fluid models (i_model 2/3) have stiffer dynamics during transient
+    # ramp-up, so the cap is the only thing keeping rho from
+    # overshooting rho_resin in the first few steps.
+    dt_pic_max = t_max / max(40 * n_pics, 1)
+    dt = min(dt, dt_pic_max)
+    dt0 = dt
+    # Growth multiplier for the adaptive dt: model 1 is forgiving, the
+    # two-fluid models are not.
+    dt_growth = 1000.0 if params.i_model == 1 else 50.0
+
+    # Absolute-pressure offset: i_model=1 stores p in normalized form
+    # (origin shifted by p_eps), i_model=2/3 store absolute pressure.
+    if params.i_model == 1:
+        p_offset = float(params.p_init - p_init_run)
+    else:
+        p_offset = 0.0
 
     snapshots = []
     def take_snapshot(step, t):
-        snap = Snapshot(step=step, t=t, gamma=gamma_vof.copy(),
-                        p=p.copy(), celltype=celltype.copy())
+        if params.i_model == 3:
+            phi_p_now = np.clip(phi0 + c_porosity * p ** 2, 1e-3, 0.95)
+            t_compact = (1.0 - phi0) / (1.0 - phi_p_now) * thickness
+            snap = Snapshot(step=step, t=t, gamma=gamma_vof.copy(),
+                            p=p.copy(), celltype=celltype.copy(),
+                            porosity=phi_p_now, thickness=t_compact,
+                            p_offset=p_offset)
+        else:
+            snap = Snapshot(step=step, t=t, gamma=gamma_vof.copy(),
+                            p=p.copy(), celltype=celltype.copy(),
+                            p_offset=p_offset)
         snapshots.append(snap)
         if on_snapshot is not None:
             on_snapshot(snap)
+
+    # Pending cascade events, sorted by activation time. At each step we
+    # flip the listed cells to CELL_INLET and pin their state to inlet
+    # values; the kernel then leaves them alone for the rest of the run.
+    pending_cascade = sorted(
+        [(float(t_a), np.asarray(cids, dtype=int))
+         for t_a, cids in (params.cascade_events or [])],
+        key=lambda e: e[0],
+    )
+
+    def _activate_cascade(cids):
+        celltype[cids] = CELL_INLET
+        rho[cids] = rho_a
+        p[cids] = p_a
+        gamma_vof[cids] = 1.0
+        u[cids] = 0.0
+        v[cids] = 0.0
 
     take_snapshot(0, 0.0)
     t_next = dt_snap
     t = 0.0
     step = 0
     while t <= t_max:
+        # Activate any cascade injection ports whose t_activate has passed.
+        while pending_cascade and t >= pending_cascade[0][0]:
+            _, cids = pending_cascade.pop(0)
+            _activate_cascade(cids)
+
+        # i_model=3: refresh porosity / permeability factor before the step
+        if params.i_model == 3:
+            phi_p = np.clip(phi0 + c_porosity * p ** 2, 1e-3, 0.95)
+            np.power(phi_p, 3, out=perm_factor)
+            perm_factor /= (1.0 - phi_p) ** 2
+            phi_target = (1.0 - phi0) / (1.0 - phi_p) * phi_p
+            # 1% relaxation, matches Julia LCMsim
+            phi_new[:] = phi_old + 0.01 * (phi_target - phi_old)
+
         _step_jit(
+            params.i_model,
             geom.celltype, geom.neighbours, geom.volume,
             geom.cc_to_cc_x, geom.cc_to_cc_y,
             geom.face_nx, geom.face_ny, geom.face_area,
             geom.T11, geom.T12, geom.T21, geom.T22,
-            porosity, Kxx, Kxy, Kyy, viscosity,
+            Kxx_base, Kxy_base, Kyy_base, perm_factor, viscosity,
+            phi_old, phi_new,
             rho, u, v, p, gamma_vof,
-            dt, float(ap[0]), float(ap[1]), float(ap[2]),
-            params.gradient_method,
+            dt,
+            ap0, ap1, ap2,
+            p_a_eos, p_init_eos, c_eos, exp_eos, rho_air_param, rho_resin_param,
         )
+        if params.i_model == 3:
+            phi_old[:] = phi_new
+
         step += 1
         t += dt
         if step > 4:
             interior = (celltype == CELL_INTERIOR) | (celltype == CELL_WALL)
             speed = np.sqrt(u[interior]**2 + v[interior]**2) + 1e-12
             h = np.sqrt(geom.volume[interior] / thickness[interior])
-            dt_conv = params.cfl * float(np.min(h / speed))
-            dt = min(max(dt_conv, dt0), 1000.0 * dt0)
+            dt_conv = params.cfl * betat2_fac * float(np.min(h / speed))
+            dt = min(max(dt_conv, dt0), dt_growth * dt0, dt_pic_max)
         if t >= t_next or t + dt > t_max:
             take_snapshot(step, t)
             t_next += dt_snap

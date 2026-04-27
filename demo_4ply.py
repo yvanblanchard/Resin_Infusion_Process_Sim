@@ -15,19 +15,28 @@ We compare two stacks on the same plate:
   - unidirectional   [0/0/0/0]:       front extends faster along x
 
 Outputs:
-  layout.png      stack overview with ply orientations
-  qiso.png        snapshots of [0/90/-45/+45] fill
-  ud0.png         snapshots of [0/0/0/0] fill
-  comparison.png  side-by-side mid-fill snapshot
+  layout.png            stack overview with ply orientations
+  qiso.png              snapshots of [0/90/-45/+45] fill
+  ud0.png               snapshots of [0/0/0/0] fill
+  comparison.png        side-by-side mid-fill snapshot
+  pressure_qiso.png     8-snapshot absolute-pressure field for [0/90/-45/+45]
+  pressure_ud0.png      8-snapshot absolute-pressure field for [0/0/0/0]
+  pressure_history.png  min/mean/max absolute pressure vs time, both stacks
 """
 import os
 import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rtmsim as rtm
+
+
+P_INLET = 2.0e5
+P_INIT = 1.0e5
 
 
 def make_ply(deg, t=0.75e-3, K1=3e-10, K2_over_K1=0.2, phi=0.70):
@@ -48,7 +57,7 @@ def run_stack(mesh, ply_angles, label):
     plies = [make_ply(a) for a in ply_angles]
     stack = rtm.LaminateStack(plies=plies)
     params = rtm.SimParameters(
-        tmax=200.0, mu_resin=0.10, p_inlet=2.0e5, p_init=1.0e5,
+        tmax=200.0, mu_resin=0.10, p_inlet=P_INLET, p_init=P_INIT,
         patch_types=[rtm.PATCH_INLET, rtm.PATCH_IGNORE,
                      rtm.PATCH_IGNORE, rtm.PATCH_IGNORE],
         n_pics=20,
@@ -181,6 +190,83 @@ def plot_comparison(mesh, snaps_list, labels, outpath):
     plt.close(fig)
 
 
+def plot_pressure_panel(ax, mesh, snap, norm, cmap):
+    p_abs = rtm.pressure_absolute(snap) / 1e5  # bar
+    tpc = ax.tripcolor(
+        mesh.nodes[:, 0], mesh.nodes[:, 1], mesh.cellgridid,
+        facecolors=p_abs, cmap=cmap, norm=norm, edgecolors='none',
+    )
+    ax.set_aspect('equal')
+    ax.set_xlim(-0.155, 0.155)
+    ax.set_ylim(-0.155, 0.155)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    interior = (snap.celltype == rtm.CELL_INTERIOR) | (snap.celltype == rtm.CELL_WALL)
+    mean_g = snap.gamma[interior].mean()
+    ax.set_title(f't = {snap.t:.1f} s\nmean γ = {mean_g:.2f}', fontsize=9)
+    return tpc
+
+
+def plot_pressure_sequence(mesh, snaps, suptitle, outpath):
+    n_show = min(8, len(snaps))
+    indices = np.linspace(0, len(snaps) - 1, n_show, dtype=int)
+    cols = min(4, n_show)
+    rows = (n_show + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(3.25 * cols, 3.4 * rows + 0.4))
+    axes = np.atleast_2d(axes)
+    flat = list(axes.flat)
+    norm = Normalize(vmin=P_INIT / 1e5, vmax=P_INLET / 1e5)
+    cmap = 'viridis'
+    for k, idx in enumerate(indices):
+        plot_pressure_panel(flat[k], mesh, snaps[idx], norm, cmap)
+    for ax in flat[n_show:]:
+        ax.set_visible(False)
+    fig.suptitle(suptitle, fontsize=12)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(),
+                        fraction=0.025, pad=0.03)
+    cbar.set_label('absolute pressure  p  [bar]')
+    fig.savefig(outpath, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_pressure_history(history, outpath):
+    fig, ax = plt.subplots(figsize=(8.0, 4.6))
+    palette = {'quasi-iso': 'C0', 'unidirectional': 'C3'}
+    for label, results in history:
+        color = palette.get(label, 'k')
+        t = results['times']
+        ax.plot(t, results['p_max'] / 1e5, '-',  color=color, lw=1.8,
+                label=f'{label}: max p')
+        ax.plot(t, results['p_mean'] / 1e5, '--', color=color, lw=1.4,
+                label=f'{label}: mean p')
+        ax.plot(t, results['p_min'] / 1e5, ':',  color=color, lw=1.2,
+                label=f'{label}: min p')
+    ax.axhline(P_INLET / 1e5, color='gray', ls='--', lw=0.8,
+               label=f'p_inlet = {P_INLET/1e5:.2f} bar')
+    ax.axhline(P_INIT / 1e5, color='gray', ls=':', lw=0.8,
+               label=f'p_init = {P_INIT/1e5:.2f} bar')
+    ax.set_xlabel('time  [s]')
+    ax.set_ylabel('absolute pressure  [bar]')
+    ax.set_title('4-ply RTM — pressure stats over fluid cells')
+    ax.legend(loc='best', fontsize=8, frameon=False, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=130, bbox_inches='tight')
+    plt.close(fig)
+
+
+def report_pressure(label, results):
+    print(f'  {label}:')
+    print(f'    p_max  range: {results["p_max"].min()/1e5:.3f} .. '
+          f'{results["p_max"].max()/1e5:.3f} bar')
+    print(f'    p_mean range: {results["p_mean"].min()/1e5:.3f} .. '
+          f'{results["p_mean"].max()/1e5:.3f} bar')
+    print(f'    p_min  range: {results["p_min"].min()/1e5:.3f} .. '
+          f'{results["p_min"].max()/1e5:.3f} bar')
+
+
 def anisotropy_report(mesh, snaps, label):
     cc = mesh.cellcenter
     target = None
@@ -228,6 +314,25 @@ def main(outdir):
     plot_comparison(mesh, [snaps_qi, snaps_ud],
                     ['quasi-iso', 'unidirectional'],
                     os.path.join(outdir, 'comparison.png'))
+
+    # ----- pressure analysis -----
+    print('\nPressure analysis (fluid cells):')
+    res_qi = rtm.pressure_results(snaps_qi)
+    res_ud = rtm.pressure_results(snaps_ud)
+    report_pressure('quasi-iso     ', res_qi)
+    report_pressure('unidirectional', res_ud)
+
+    plot_pressure_sequence(
+        mesh, snaps_qi,
+        'Quasi-isotropic [0/90/-45/+45] — absolute pressure [bar]',
+        os.path.join(outdir, 'pressure_qiso.png'))
+    plot_pressure_sequence(
+        mesh, snaps_ud,
+        'Unidirectional [0/0/0/0] — absolute pressure [bar]',
+        os.path.join(outdir, 'pressure_ud0.png'))
+    plot_pressure_history(
+        [('quasi-iso', res_qi), ('unidirectional', res_ud)],
+        os.path.join(outdir, 'pressure_history.png'))
 
     anisotropy_report(mesh, snaps_qi, 'quasi-isotropic')
     anisotropy_report(mesh, snaps_ud, 'unidirectional [0/0/0/0]')
