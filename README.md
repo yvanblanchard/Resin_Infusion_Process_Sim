@@ -71,6 +71,36 @@ and every cell whose centre lies within `radius` becomes an inlet cell
 cure runs add `set_thermal(...)`, `enable_cure()` and the resin/fabric
 thermal, viscosity-model and cure-kinetics setters (see `demo_thermal.py`).
 
+### Laminate layout and fibre orientation
+
+`set_laminate(stack)` is the default stack of every element.
+`add_laminate_region(stack, cell_ids)` gives other elements a different
+stack (other ply count, thicknesses or fabrics, e.g. ply drops or UD
+reinforcements); later regions override earlier ones. Each element's
+permeability is the thickness-weighted average of its own plies.
+
+A ply's `refdir` is either one global vector or one vector per element
+(`(N, 3)`), projected onto each element. `angle_deg` on `add_ply` (scalar
+or `(N,)`) and `sim.set_fibre_deviation(angle_deg)` (all plies) rotate it
+about the face normal (right-hand rule on the mesh face orientation),
+e.g. to apply a draping-simulation deviation. A UD ply is simply a fabric
+with `K1 >> K2`.
+
+```python
+ud = rtm.FabricMaterial("UD").set_permeability(6e-10, 3e-11).set_porosity(0.5)
+hoop = mesh.get_cylindrical_directions(origin=(0, 0, 0), axis=(0, 0, 1), kind="hoop")
+base = rtm.LaminateStack().add_ply(fabric, 1e-3, refdir=(1, 0, 0))
+pad = (rtm.LaminateStack().add_ply(fabric, 1e-3, refdir=(1, 0, 0))
+       .add_ply(ud, 1e-3, refdir=hoop)
+       .add_ply(ud, 1e-3, refdir=(1, 0, 0), angle_deg=45.0))
+sim.set_laminate(base).add_laminate_region(pad, pad_cells)
+sim.set_fibre_deviation(shear_deg)      # optional, (N,) [deg]
+stacks, stack_id = sim.get_laminate_map()
+```
+
+A `refdir` nearly normal to some elements gives an ill-defined fibre
+angle there and triggers a warning; use per-element directions instead.
+
 The time loop runs compiled (Numba) and the flow kernel is multi-threaded.
 The thread count defaults to about one thread per 500 cells, capped at the
 machine's thread count. Override it with

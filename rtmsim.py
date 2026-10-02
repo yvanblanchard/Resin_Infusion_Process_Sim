@@ -20,8 +20,9 @@ Object model
     ResinMaterial    resin flow / thermal / cure properties
     FabricMaterial   dry reinforcement: permeability, porosity,
                      compaction law, fibre thermal properties
-    LaminateStack    ordered plies (fabric + thickness + fibre direction)
-                     shared by every element (PCOMP-style)
+    LaminateStack    ordered plies (fabric + thickness + fibre direction,
+                     global or per element); one default stack plus
+                     optional per-region stacks (PCOMP-style)
     ShellMesh        triangle shell mesh backed by a trimesh.Trimesh
                      (STL file, trimesh object or numpy arrays)
     SolverSettings   numerical constants (CFL, EOS fit, dt control, ...)
@@ -336,21 +337,47 @@ class FabricMaterial:
 
 
 class Ply:
-    """One ply: a fabric, its thickness [m] and global-frame fibre direction."""
+    """
+    One ply: a fabric, its thickness [m] and fibre direction.
 
-    def __init__(self, fabric, thickness, refdir):
+    refdir is a global-frame vector (3,) shared by every element, or one
+    vector per element (N, 3) (e.g. from a draping tool or
+    ShellMesh.get_cylindrical_directions). It is projected onto each
+    element's tangent plane. angle_deg [deg] then rotates the projected
+    direction about the element normal (right-hand rule on the mesh face
+    orientation); it is a scalar or one value per element (N,), e.g. a
+    local fibre deviation.
+    """
+
+    def __init__(self, fabric, thickness, refdir, angle_deg=0.0):
         if not isinstance(fabric, FabricMaterial):
             raise TypeError("fabric must be a FabricMaterial")
-        refdir = np.asarray(refdir, dtype=np.float64).reshape(3)
-        if not np.linalg.norm(refdir) > 0.0:
-            raise ValueError("refdir must be a non-zero vector")
+        refdir = np.array(refdir, dtype=np.float64)
+        if refdir.ndim == 1:
+            refdir = refdir.reshape(3)
+        elif refdir.ndim != 2 or refdir.shape[1] != 3:
+            raise ValueError("refdir must be a (3,) or (N, 3) array")
+        if not np.all(np.linalg.norm(refdir, axis=-1) > 0.0):
+            raise ValueError("refdir must be non-zero")
+        angle_deg = np.array(angle_deg, dtype=np.float64)
+        if angle_deg.ndim > 1:
+            raise ValueError("angle_deg must be a scalar or an (N,) array")
+        if not np.all(np.isfinite(angle_deg)):
+            raise ValueError("angle_deg must be finite")
         self._fabric = fabric
         self._thickness = _positive(thickness, "ply thickness")
         self._refdir = refdir
+        self._angle_deg = angle_deg
 
     def __repr__(self):
+        refdir = (self._refdir.tolist() if self._refdir.ndim == 1
+                  else f"per-element({self._refdir.shape[0]})")
+        angle = (f", angle_deg={float(self._angle_deg):g}"
+                 if self._angle_deg.ndim == 0 and self._angle_deg != 0.0
+                 else (f", angle_deg=per-element({self._angle_deg.size})"
+                       if self._angle_deg.ndim == 1 else ""))
         return (f"Ply({self._fabric.get_name()!r}, "
-                f"t={self._thickness:g}, refdir={self._refdir.tolist()})")
+                f"t={self._thickness:g}, refdir={refdir}{angle})")
 
     def get_fabric(self):
         return self._fabric
@@ -359,13 +386,30 @@ class Ply:
         return self._thickness
 
     def get_refdir(self):
+        """(3,) global direction or (N, 3) per-element directions."""
         return self._refdir.copy()
+
+    def get_angle_deg(self):
+        """Scalar or (N,) rotation about the element normal [deg]."""
+        return self._angle_deg.copy()
+
+    def validate(self, n_cells):
+        """Per-element refdir / angle arrays must have one row per cell."""
+        if self._refdir.ndim == 2 and self._refdir.shape[0] != n_cells:
+            raise ValueError(f"{self!r}: refdir has {self._refdir.shape[0]} "
+                             f"rows, mesh has {n_cells} cells")
+        if self._angle_deg.ndim == 1 and self._angle_deg.size != n_cells:
+            raise ValueError(f"{self!r}: angle_deg has {self._angle_deg.size} "
+                             f"values, mesh has {n_cells} cells")
 
 
 class LaminateStack:
     """
-    Stack of plies covering the full mesh — one stack shared by every
-    element. The element's geometric (e1, e2, e3) frame is built from
+    Ordered stack of plies (PCOMP-style). A simulation uses one default
+    stack for every element; RTMSimulation.add_laminate_region assigns
+    other stacks (different ply count / thickness / fabrics, e.g. ply
+    drops or UD reinforcements) to subsets of elements. The element's
+    geometric (e1, e2, e3) frame is built from
     its triangle nodes; each ply's `refdir` is projected into the
     element's tangent plane to get a local angle, then the ply's
     diagonal local-frame tensor diag(K1, K2) is rotated into the
@@ -387,8 +431,9 @@ class LaminateStack:
     def __repr__(self):
         return f"LaminateStack({len(self._plies)} plies)"
 
-    def add_ply(self, fabric, thickness, refdir):
-        self._plies.append(Ply(fabric, thickness, refdir))
+    def add_ply(self, fabric, thickness, refdir, angle_deg=0.0):
+        """Append a ply; see Ply for refdir / angle_deg conventions."""
+        self._plies.append(Ply(fabric, thickness, refdir, angle_deg))
         return self
 
     def get_plies(self):
@@ -423,9 +468,12 @@ class LaminateStack:
         return float(sum(v * p.get_thickness() for v, p in zip(vals, self._plies))
                      / self.get_total_thickness())
 
-    def validate(self, thermal=False):
+    def validate(self, thermal=False, n_cells=None):
         if not self._plies:
             raise ValueError("LaminateStack has no plies (use add_ply)")
+        if n_cells is not None:
+            for ply in self._plies:
+                ply.validate(n_cells)
         for fabric in {id(p.get_fabric()): p.get_fabric()
                        for p in self._plies}.values():
             fabric.validate(thermal=thermal)
@@ -644,6 +692,37 @@ class ShellMesh:
     def get_cell_areas(self):
         """Cell areas [m^2]."""
         return self._tm.area_faces.copy()
+
+    def get_cell_normals(self):
+        """Unit cell normals from the original face orientation."""
+        return self._tm.face_normals.copy()
+
+    def get_cylindrical_directions(self, origin, axis, kind="hoop"):
+        """
+        Per-cell fibre directions (N, 3) of a cylindrical frame, for use
+        as a per-element Ply refdir. `origin` (input units) and `axis`
+        define the cylinder axis; kind is "hoop" (axis x radial),
+        "radial" or "axial". Cells on the axis get a radial direction of
+        zero length and are rejected.
+        """
+        a = np.asarray(axis, dtype=np.float64).reshape(3)
+        if not np.linalg.norm(a) > 0.0:
+            raise ValueError("axis must be a non-zero vector")
+        a = a / np.linalg.norm(a)
+        if kind == "axial":
+            return np.tile(a, (self.N, 1))
+        d = self.cellcenter - self.to_solver_units(
+            np.asarray(origin, dtype=np.float64).reshape(3))
+        radial = d - (d @ a)[:, None] * a
+        r = np.linalg.norm(radial, axis=1)
+        if np.any(r <= 1e-12 * max(float(r.max()), 1e-300)):
+            raise ValueError("cells lie on the cylinder axis")
+        radial /= r[:, None]
+        if kind == "radial":
+            return radial
+        if kind == "hoop":
+            return np.cross(a, radial)
+        raise ValueError('kind must be "hoop", "radial" or "axial"')
 
     def to_solver_units(self, x):
         return np.asarray(x, dtype=np.float64) * self._scale
@@ -1004,81 +1083,113 @@ def create_coordinate_systems(mesh, neighbours, celltype, thickness, max_neighbo
     )
 
 
-def build_stack_tensor(mesh, stack):
+def element_frames(mesh):
     """
-    Per-element 2x2 in-plane permeability tensor for a stacked laminate.
+    Per-element geometric frame (e1, e2, e3), each (N, 3), plus the sign
+    (N,) of e3 against the original face normal. e1 runs along the first
+    edge of the sorted triangle, e2 is in-plane orthogonal to it; this is
+    the frame the solver and the K tensor work in.
+    """
+    nodes = mesh.nodes
+    cg = mesh.cellgridid
+    e1 = nodes[cg[:, 1]] - nodes[cg[:, 0]]
+    e1 /= np.linalg.norm(e1, axis=1)[:, None]
+    a2 = nodes[cg[:, 2]] - nodes[cg[:, 0]]
+    a2 /= np.linalg.norm(a2, axis=1)[:, None]
+    e2 = a2 - np.einsum("ij,ij->i", e1, a2)[:, None] * e1
+    e2 /= np.linalg.norm(e2, axis=1)[:, None]
+    e3 = np.cross(e1, e2)
+    f = mesh.faces
+    n_face = np.cross(nodes[f[:, 1]] - nodes[f[:, 0]],
+                      nodes[f[:, 2]] - nodes[f[:, 0]])
+    sign = np.where(np.einsum("ij,ij->i", e3, n_face) < 0.0, -1.0, 1.0)
+    return e1, e2, e3, sign
 
-    For each element, build the local geometric frame (e1, e2, e3)
-    from the triangle nodes. For each ply, project its global refdir
-    into that element's tangent plane to get the angle in (e1, e2).
-    The ply's tensor in the element frame is
+
+def build_stack_tensor(mesh, stacks, stack_id, deviation_deg=None,
+                       normal_tol=0.1):
+    """
+    Per-element 2x2 in-plane permeability tensor for stacked laminates.
+
+    stacks is a list of LaminateStack, stack_id (N,) the stack index of
+    each element (one stack per element, plies may differ between
+    stacks). For each element and each ply of its stack, the ply refdir
+    (global or per-element) is projected onto the element tangent plane
+    and normalised; the ply angle_deg plus the element deviation_deg
+    (None, scalar or (N,)) then rotate it about the face normal. The
+    ply's tensor in the element frame (e1, e2) is
 
         R(alpha_p) . diag(K1_p, K2_p) . R(alpha_p)^T
 
-    The element-effective tensor is the thickness-weighted sum of ply
-    tensors divided by total stack thickness. Porosity is constant per
-    ply, so phi0_eff and the i_model=3 porosity quadratic coefficient
-    c_eff are also stack averages of per-ply values (independent of
-    element orientation). All four arrays are returned per element.
+    and the element tensor is the thickness-weighted sum of ply tensors
+    divided by the thickness of that element's stack (parallel flow
+    through the plies).
+
+    A refdir closer than normal_tol (in-plane component) to the element
+    normal gives an ill-defined fibre angle and triggers a warning; an
+    exactly normal refdir falls back to e1.
+
+    Returns (Kxx, Kxy, Kyy), each (N,).
     """
     N = mesh.N
-    nodes = mesh.nodes
-    cg = mesh.cellgridid
+    stack_id = np.asarray(stack_id, dtype=np.int64)
+    e1, e2, _, sign = element_frames(mesh)
     Kxx = np.zeros(N)
     Kxy = np.zeros(N)
     Kyy = np.zeros(N)
-    t_tot = stack.get_total_thickness()
-    if t_tot <= 0:
-        raise ValueError("Stack has zero total thickness")
+    dev = (np.zeros(N) if deviation_deg is None
+           else np.broadcast_to(np.asarray(deviation_deg, dtype=np.float64),
+                                (N,)))
+    n_steep = 0
 
-    phi0_eff = stack.get_effective_porosity()
-    c_eff = stack.get_effective_c_porosity()
-    phi0 = np.full(N, phi0_eff)
-    c_porosity = np.full(N, c_eff)
+    for s, stack in enumerate(stacks):
+        cells = np.where(stack_id == s)[0]
+        if cells.size == 0:
+            continue
+        t_tot = stack.get_total_thickness()
+        if t_tot <= 0:
+            raise ValueError(f"{stack!r} has zero total thickness")
+        steep = np.zeros(cells.size, dtype=bool)
+        for ply in stack.get_plies():
+            K1p, K2p = ply.get_fabric().get_permeability()
+            w = ply.get_thickness()
+            r = ply.get_refdir()
+            r = (np.broadcast_to(r, (cells.size, 3)) if r.ndim == 1
+                 else r[cells])
+            r = r / np.linalg.norm(r, axis=1, keepdims=True)
+            rx = np.einsum("ij,ij->i", r, e1[cells])
+            ry = np.einsum("ij,ij->i", r, e2[cells])
+            mag = np.sqrt(rx * rx + ry * ry)
+            steep |= mag < normal_tol
+            flat = mag < 1e-30
+            mag = np.where(flat, 1.0, mag)
+            c = np.where(flat, 1.0, rx / mag)
+            sn = np.where(flat, 0.0, ry / mag)
 
-    plies = [(p.get_refdir(), *p.get_fabric().get_permeability(),
-              p.get_thickness()) for p in stack.get_plies()]
+            ang = np.broadcast_to(ply.get_angle_deg(), (N,))[cells] + dev[cells]
+            if np.any(ang != 0.0):
+                # Rotate about the face normal; sign maps it onto e3.
+                th = np.radians(ang) * sign[cells]
+                ct, st_ = np.cos(th), np.sin(th)
+                c, sn = c * ct - sn * st_, sn * ct + c * st_
 
-    for ind in range(N):
-        i1, i2, i3 = cg[ind]
-        e1 = nodes[i2] - nodes[i1]
-        e1 /= np.linalg.norm(e1)
-        a2 = nodes[i3] - nodes[i1]
-        a2 /= np.linalg.norm(a2)
-        e2 = a2 - np.dot(e1, a2) * e1
-        e2 /= np.linalg.norm(e2)
+            Kxx[cells] += (c * c * K1p + sn * sn * K2p) * w
+            Kxy[cells] += (c * sn * (K1p - K2p)) * w
+            Kyy[cells] += (sn * sn * K1p + c * c * K2p) * w
 
-        Kxx_e = 0.0
-        Kxy_e = 0.0
-        Kyy_e = 0.0
-        for r, K1p, K2p, w in plies:
-            rn = np.linalg.norm(r)
-            if rn == 0:
-                continue
-            r = r / rn
-            rx = float(r @ e1)
-            ry = float(r @ e2)
-            mag = (rx * rx + ry * ry) ** 0.5
-            if mag < 1e-30:
-                rx = 1.0
-                ry = 0.0
-            else:
-                rx /= mag
-                ry /= mag
-            c = rx
-            s = ry
-            kxx = c * c * K1p + s * s * K2p
-            kyy = s * s * K1p + c * c * K2p
-            kxy = c * s * (K1p - K2p)
-            Kxx_e += kxx * w
-            Kxy_e += kxy * w
-            Kyy_e += kyy * w
+        Kxx[cells] /= t_tot
+        Kxy[cells] /= t_tot
+        Kyy[cells] /= t_tot
+        n_steep += int(steep.sum())
 
-        Kxx[ind] = Kxx_e / t_tot
-        Kxy[ind] = Kxy_e / t_tot
-        Kyy[ind] = Kyy_e / t_tot
-
-    return Kxx, Kxy, Kyy, phi0, c_porosity
+    if n_steep:
+        warnings.warn(
+            f"{n_steep} element(s) have a ply refdir within "
+            f"{np.degrees(np.arcsin(normal_tol)):.1f} deg of the element "
+            f"normal: the projected fibre angle there is ill-defined. Use a "
+            f"per-element refdir (e.g. ShellMesh.get_cylindrical_directions).",
+            RuntimeWarning, stacklevel=2)
+    return Kxx, Kxy, Kyy
 
 
 # --------------------------------------------------------------------------
@@ -1517,7 +1628,7 @@ def _step_thermal_jit(
         # Effective volumetric heat capacity. Resin contribution is
         # weighted by gamma so dry preform sees only fiber thermal mass.
         rcp_resin = phi * g_i * rho_resin * cp_resin
-        rcp_fiber = (1.0 - phi) * rho_fiber * cp_fiber
+        rcp_fiber = (1.0 - phi) * rho_fiber[i] * cp_fiber[i]
         rcp = rcp_resin + rcp_fiber
         if rcp < 1e-12:
             continue
@@ -1805,6 +1916,12 @@ class RTMSimulation:
     Required inputs: mesh, process model, resin, laminate, pressures, air
     EOS, run control and at least one injection port active at t = 0.
     Thermal (set_thermal) and cure (enable_cure) are optional.
+
+    Laminate: set_laminate() gives the default stack of every element;
+    add_laminate_region() overrides it on a set of elements (later
+    regions win), so elements can carry different stacking sequences
+    and thicknesses. set_fibre_deviation() adds a per-element rotation
+    [deg] to the fibre direction of every ply.
     """
 
     def __init__(self):
@@ -1812,6 +1929,8 @@ class RTMSimulation:
         self._i_model = None
         self._resin = None
         self._stack = None
+        self._laminate_regions = []
+        self._fibre_deviation = None
         self._p_inlet = None
         self._p_init = None
         self._air = None
@@ -1855,9 +1974,42 @@ class RTMSimulation:
         return self
 
     def set_laminate(self, stack):
-        if not isinstance(stack, LaminateStack):
+        """Default stack, used by every element not in a laminate region."""
+        if stack is not None and not isinstance(stack, LaminateStack):
             raise TypeError("stack must be a LaminateStack")
         self._stack = stack
+        return self
+
+    def add_laminate_region(self, stack, cell_ids):
+        """
+        Assign `stack` to the elements `cell_ids` (e.g. a ply-drop zone or
+        a BDF PID group). Regions are applied in order after the default
+        stack, so a later region overrides an earlier one on shared cells.
+        """
+        if not isinstance(stack, LaminateStack):
+            raise TypeError("stack must be a LaminateStack")
+        cell_ids = np.unique(np.asarray(cell_ids, dtype=np.int64).ravel())
+        if cell_ids.size == 0:
+            raise ValueError("laminate region: empty cell list")
+        self._laminate_regions.append((stack, cell_ids))
+        return self
+
+    def clear_laminate_regions(self):
+        self._laminate_regions = []
+        return self
+
+    def set_fibre_deviation(self, angle_deg):
+        """
+        Per-element fibre deviation [deg] (scalar or (N,)), added to every
+        ply's direction as a rotation about the face normal (right-hand
+        rule on the mesh face orientation). None removes it.
+        """
+        if angle_deg is not None:
+            angle_deg = np.array(angle_deg, dtype=np.float64)
+            if angle_deg.ndim > 1 or not np.all(np.isfinite(angle_deg)):
+                raise ValueError("fibre deviation must be a finite scalar "
+                                 "or (N,) array")
+        self._fibre_deviation = angle_deg
         return self
 
     def set_pressures(self, p_inlet, p_init):
@@ -1981,7 +2133,49 @@ class RTMSimulation:
         return self._resin
 
     def get_laminate(self):
+        """Default stack (see get_laminate_map for the per-element layout)."""
         return self._stack
+
+    def get_laminate_regions(self):
+        return list(self._laminate_regions)
+
+    def get_fibre_deviation(self):
+        return (None if self._fibre_deviation is None
+                else self._fibre_deviation.copy())
+
+    def get_laminate_map(self):
+        """
+        (stacks, stack_id): the distinct stacks in use and, per element,
+        the index into `stacks`; -1 marks elements without a laminate.
+        """
+        if self._mesh is None:
+            raise ValueError("RTMSimulation: set_mesh() first")
+        N = self._mesh.N
+        stacks = []
+        stack_id = np.full(N, -1, dtype=np.int64)
+
+        def index(st):
+            for k, s in enumerate(stacks):
+                if s is st:
+                    return k
+            stacks.append(st)
+            return len(stacks) - 1
+
+        if self._stack is not None:
+            stack_id[:] = index(self._stack)
+        for st, cells in self._laminate_regions:
+            if cells.min() < 0 or cells.max() >= N:
+                raise IndexError(f"laminate region {st!r}: cell id out of "
+                                 f"range")
+            stack_id[cells] = index(st)
+        used = np.unique(stack_id[stack_id >= 0])
+        if used.size < len(stacks):
+            # Drop stacks fully overridden by later regions.
+            remap = np.full(len(stacks), -1, dtype=np.int64)
+            remap[used] = np.arange(used.size)
+            stacks = [stacks[k] for k in used]
+            stack_id = np.where(stack_id >= 0, remap[stack_id], -1)
+        return stacks, stack_id
 
     def get_pressures(self):
         return self._p_inlet, self._p_init
@@ -2014,7 +2208,9 @@ class RTMSimulation:
             ("mesh (set_mesh)", self._mesh),
             ("process model (set_process_model)", self._i_model),
             ("resin (set_resin)", self._resin),
-            ("laminate (set_laminate)", self._stack),
+            ("laminate (set_laminate / add_laminate_region)",
+             self._stack if self._stack is not None
+             else (self._laminate_regions or None)),
             ("pressures (set_pressures)", self._p_inlet),
             ("air EOS (set_air_eos)", self._air),
             ("run control (set_run_control)", self._tmax),
@@ -2028,7 +2224,18 @@ class RTMSimulation:
             raise ValueError("enable_cure requires set_thermal()")
         self._resin.validate(self._i_model, thermal=thermal,
                              cure=self._cure_enabled)
-        self._stack.validate(thermal=thermal)
+        N = self._mesh.N
+        stacks, stack_id = self.get_laminate_map()
+        n_bare = int((stack_id < 0).sum())
+        if n_bare:
+            raise ValueError(f"{n_bare} cells have no laminate: set a default "
+                             f"stack with set_laminate()")
+        for st in stacks:
+            st.validate(thermal=thermal, n_cells=N)
+        dev = self._fibre_deviation
+        if dev is not None and dev.ndim == 1 and dev.size != N:
+            raise ValueError(f"fibre deviation has {dev.size} values, mesh "
+                             f"has {N} cells")
         if self._i_model == 3:
             # Sanity-check the porosity quadratic at the operating
             # pressure: if phi(p_inlet) is close to 1 the preform is
@@ -2036,16 +2243,17 @@ class RTMSimulation:
             # phi^3/(1-phi)^2 diverges (>= ~73 already at phi=0.9), and
             # dt has to collapse to keep the solver stable.
             lim = self._settings.max_porosity_at_inlet
-            for k, ply in enumerate(self._stack.get_plies()):
-                fab = ply.get_fabric()
-                phi_at_inlet = (fab.get_porosity()
-                                + fab.get_porosity_quadratic_c()
-                                * self._p_inlet ** 2)
-                if phi_at_inlet > lim:
-                    raise ValueError(
-                        f"i_model=3: ply {k} porosity at p_inlet="
-                        f"{self._p_inlet:.0f} Pa is {phi_at_inlet:.3f} "
-                        f"(> {lim}). Reduce porosity_at_p1 or increase p1.")
+            for st in stacks:
+                for k, ply in enumerate(st.get_plies()):
+                    fab = ply.get_fabric()
+                    phi_at_inlet = (fab.get_porosity()
+                                    + fab.get_porosity_quadratic_c()
+                                    * self._p_inlet ** 2)
+                    if phi_at_inlet > lim:
+                        raise ValueError(
+                            f"i_model=3: {st!r} ply {k} porosity at p_inlet="
+                            f"{self._p_inlet:.0f} Pa is {phi_at_inlet:.3f} "
+                            f"(> {lim}). Reduce porosity_at_p1 or increase p1.")
         self._resolve_ports()
 
     def _resolve_ports(self):
@@ -2112,7 +2320,7 @@ class RTMSimulation:
         st = self._settings
         mesh = self._mesh
         resin = self._resin
-        stack = self._stack
+        stacks, stack_id = self.get_laminate_map()
         i_model = self._i_model
         p_ref, rho_ref, gamma_air = self._air
         thermal_on = self._thermal is not None
@@ -2150,9 +2358,14 @@ class RTMSimulation:
                 f"port and will stay dry; they are excluded from the fill "
                 f"criterion.", RuntimeWarning, stacklevel=2)
 
-        t_tot = stack.get_total_thickness()
-        thickness = np.full(N, t_tot)
-        porosity = np.full(N, stack.get_effective_porosity())
+        # Per-element laminate scalars: each stack's value mapped to its cells.
+        def per_element(fn):
+            return np.array([fn(s) for s in stacks], dtype=np.float64)[stack_id]
+
+        thickness = per_element(LaminateStack.get_total_thickness)
+        porosity = per_element(LaminateStack.get_effective_porosity)
+        phi0 = porosity.copy()
+        c_porosity = per_element(LaminateStack.get_effective_c_porosity)
         viscosity = (np.full(N, resin.get_viscosity()) if not thermal_on
                      else None)
 
@@ -2168,8 +2381,8 @@ class RTMSimulation:
             setattr(geom, name,
                     np.ascontiguousarray(getattr(geom, name)[:, :k_used]))
 
-        Kxx_base, Kxy_base, Kyy_base, phi0, c_porosity = \
-            build_stack_tensor(mesh, stack)
+        Kxx_base, Kxy_base, Kyy_base = build_stack_tensor(
+            mesh, stacks, stack_id, self._fibre_deviation)
 
         # ---- choose EOS exponent (auto-bump for race-tracking) ----
         K_eig = _eigmax_K(Kxx_base, Kxy_base, Kyy_base)
@@ -2245,10 +2458,10 @@ class RTMSimulation:
                 C1, C2, vm["mu_max"], st.mu_floor, cure_on,
             )
             cp_resin = resin.get_specific_heat()
-            rho_fiber = stack.get_effective_fibre_property(
-                FabricMaterial.get_density)
-            cp_fiber = stack.get_effective_fibre_property(
-                FabricMaterial.get_specific_heat)
+            rho_fiber = per_element(lambda s: s.get_effective_fibre_property(
+                FabricMaterial.get_density))
+            cp_fiber = per_element(lambda s: s.get_effective_fibre_property(
+                FabricMaterial.get_specific_heat))
         else:
             T_field = np.empty(0)
             alpha_field = np.empty(0)
@@ -2356,7 +2569,8 @@ class RTMSimulation:
         # Scalars for the compiled loop (unused ones get neutral values).
         if not thermal_on:
             alpha_gel = C1 = C2 = 0.0
-            cp_resin = rho_fiber = cp_fiber = 0.0
+            cp_resin = 0.0
+            rho_fiber = cp_fiber = np.zeros(N)
         h_cfl = np.maximum(np.sqrt(geom.volume / thickness), h_floor)
         cfl_fac = st.cfl * betat2_fac
 
@@ -2381,7 +2595,7 @@ class RTMSimulation:
                 float(p_a_eos), float(p_init_eos), float(c_eos), exp_eos,
                 float(rho_air_param), float(rho_resin_param),
                 thickness, porosity, T_field, alpha_field,
-                float(cp_resin), float(rho_fiber), float(cp_fiber),
+                float(cp_resin), rho_fiber, cp_fiber,
                 float(th.get("h_tool", 0.0)), float(th.get("T_tool", 0.0)),
                 float(vm.get("mu_inf") or 0.0), float(vm.get("E_mu") or 0.0),
                 float(alpha_gel), float(C1), float(C2),
