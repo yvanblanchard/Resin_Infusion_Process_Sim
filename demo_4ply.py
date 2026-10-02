@@ -37,37 +37,46 @@ import rtmsim as rtm
 
 P_INLET = 2.0e5
 P_INIT = 1.0e5
+AIR_EOS = dict(p_ref=1.01325e5, rho_ref=1.225, gamma=1.4)
+MU_RESIN = 0.10
+T_PLY = 0.75e-3
 
 
-def make_ply(deg, t=0.75e-3, K1=3e-10, K2_over_K1=0.2, phi=0.70):
+def make_fabric(K1=3e-10, K2_over_K1=0.2, phi=0.70):
+    return (rtm.FabricMaterial('fabric')
+            .set_permeability(K1, K1 * K2_over_K1)
+            .set_porosity(phi))
+
+
+def fibre_dir(deg):
     th = np.deg2rad(deg)
-    return rtm.PlyProperties(
-        thickness=t, porosity=phi, K1=K1, K2=K1 * K2_over_K1,
-        refdir=np.array([np.cos(th), np.sin(th), 0.0]),
-    )
+    return np.array([np.cos(th), np.sin(th), 0.0])
 
 
-def build_mesh_demo(side=0.30, n_div=20, inlet_radius=0.02):
-    mesh = rtm.make_square_plate(side=side, n_div=n_div)
-    rtm.assign_patch_by_disk(mesh, 0, (0.0, 0.0), inlet_radius)
-    return mesh
+def build_mesh_demo(side=0.30, n_div=20):
+    return rtm.ShellMesh.make_square_plate(side=side, n_div=n_div)
 
 
-def run_stack(mesh, ply_angles, label):
-    plies = [make_ply(a) for a in ply_angles]
-    stack = rtm.LaminateStack(plies=plies)
-    params = rtm.SimParameters(
-        tmax=200.0, mu_resin=0.10, p_inlet=P_INLET, p_init=P_INIT,
-        patch_types=[rtm.PATCH_INLET, rtm.PATCH_IGNORE,
-                     rtm.PATCH_IGNORE, rtm.PATCH_IGNORE],
-        n_pics=20,
-        stack=stack,
-    )
-    print(f'  {label}: {len(plies)} plies, t_tot={stack.total_thickness*1e3:.2f}mm')
+def run_stack(mesh, ply_angles, label, inlet_radius=0.02):
+    fabric = make_fabric()
+    stack = rtm.LaminateStack()
+    for a in ply_angles:
+        stack.add_ply(fabric, T_PLY, fibre_dir(a))
+    sim = (rtm.RTMSimulation()
+           .set_mesh(mesh)
+           .set_process_model(1)
+           .set_resin(rtm.ResinMaterial('resin').set_viscosity(MU_RESIN))
+           .set_laminate(stack)
+           .set_pressures(p_inlet=P_INLET, p_init=P_INIT)
+           .set_air_eos(**AIR_EOS)
+           .set_run_control(tmax=200.0, n_pics=20)
+           .add_injection_port((0.0, 0.0, 0.0), radius=inlet_radius))
+    print(f'  {label}: {stack.get_num_plies()} plies, '
+          f't_tot={stack.get_total_thickness()*1e3:.2f}mm')
     t0 = time.time()
-    snaps = rtm.run_filling(mesh, params)
+    snaps = sim.run()
     print(f'    -> {time.time()-t0:.1f}s, {len(snaps)} snapshots')
-    return stack, snaps
+    return sim, snaps
 
 
 # ---------- plotting ----------
@@ -191,7 +200,7 @@ def plot_comparison(mesh, snaps_list, labels, outpath):
 
 
 def plot_pressure_panel(ax, mesh, snap, norm, cmap):
-    p_abs = rtm.pressure_absolute(snap) / 1e5  # bar
+    p_abs = snap.get_pressure_absolute() / 1e5  # bar
     tpc = ax.tripcolor(
         mesh.nodes[:, 0], mesh.nodes[:, 1], mesh.cellgridid,
         facecolors=p_abs, cmap=cmap, norm=norm, edgecolors='none',
@@ -302,8 +311,8 @@ def main(outdir):
     plot_stack_layout(layouts, os.path.join(outdir, 'layout.png'))
 
     print('\nSolving (first call triggers JIT compile)...')
-    stack_qi, snaps_qi = run_stack(mesh, [0, 90, -45, 45], '[0/90/-45/+45]')
-    stack_ud, snaps_ud = run_stack(mesh, [0, 0, 0, 0],     '[0/0/0/0]')
+    sim_qi, snaps_qi = run_stack(mesh, [0, 90, -45, 45], '[0/90/-45/+45]')
+    sim_ud, snaps_ud = run_stack(mesh, [0, 0, 0, 0],     '[0/0/0/0]')
 
     plot_sequence(mesh, snaps_qi,
                   'Quasi-isotropic stack [0/90/-45/+45]',
@@ -317,8 +326,8 @@ def main(outdir):
 
     # ----- pressure analysis -----
     print('\nPressure analysis (fluid cells):')
-    res_qi = rtm.pressure_results(snaps_qi)
-    res_ud = rtm.pressure_results(snaps_ud)
+    res_qi = sim_qi.get_pressure_results()
+    res_ud = sim_ud.get_pressure_results()
     report_pressure('quasi-iso     ', res_qi)
     report_pressure('unidirectional', res_ud)
 

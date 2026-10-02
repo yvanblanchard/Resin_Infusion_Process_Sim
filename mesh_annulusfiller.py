@@ -153,49 +153,34 @@ def build_mesh_from_bdf(path):
         sorted(eid_to_cellidx[e] for e in inlet_eids if e in eid_to_cellidx),
         dtype=int,
     )
-    mesh = rtm.build_mesh(nodes_arr, tri_arr,
-                          patch_cell_ids=[inlet_cells, [], [], []])
+    mesh = rtm.ShellMesh.from_arrays(nodes_arr, tri_arr)
     return mesh, nodes_arr, tri_arr, inlet_cells
 
 
-def find_cells_near_point(mesh, point, radius):
-    """Return cell indices whose cellcenter lies within `radius` of point.
-    If none are within radius, fall back to the single closest cell."""
-    p = np.asarray(point, dtype=np.float64)
-    d = np.linalg.norm(mesh.cellcenter - p, axis=1)
-    within = np.where(d <= radius)[0]
-    if within.size:
-        return within.astype(int), float(d[within].min())
-    closest = int(np.argmin(d))
-    return np.array([closest], dtype=int), float(d[closest])
-
-
-def build_params(p_in, n_pics_override=None, cascade_events=None):
+def build_simulation(mesh, p_in, inlet_cells, n_pics_override=None):
+    """RTMSimulation from the parsed legacy input; SET 1 cells form patch 1."""
     pf = p_in["preform"]
-    ply = rtm.PlyProperties(
-        thickness=pf["thickness"], porosity=pf["porosity"],
-        K1=pf["K1"], K2=pf["K2"],
-        refdir=np.asarray(pf["refdir"], dtype=np.float64),
-    )
-    stack = rtm.LaminateStack(plies=[ply])
+    fabric = (rtm.FabricMaterial("preform")
+              .set_permeability(pf["K1"], pf["K2"])
+              .set_porosity(pf["porosity"]))
+    stack = rtm.LaminateStack().add_ply(fabric, pf["thickness"], pf["refdir"])
+    resin = rtm.ResinMaterial("resin").set_viscosity(p_in["mu_resin"])
     n_pics = n_pics_override if n_pics_override is not None else p_in["n_pics"]
-    params = rtm.SimParameters(
-        i_model=p_in["i_model"],
-        tmax=p_in["tmax"],
-        p_ref=p_in["p_ref"], rho_ref=p_in["rho_ref"], gamma=p_in["gamma_eos"],
-        mu_resin=p_in["mu_resin"],
-        p_inlet=p_in["p_inlet"], p_init=p_in["p_init"],
-        patch_types=[
-            rtm.PATCH_INLET if t == 1 else
-            rtm.PATCH_OUTLET if t == 3 else
-            rtm.PATCH_IGNORE
-            for t in p_in["patch_types"]
-        ],
-        n_pics=n_pics,
-        stack=stack,
-        cascade_events=list(cascade_events or []),
-    )
-    return params
+    sim = (rtm.RTMSimulation()
+           .set_mesh(mesh)
+           .set_process_model(p_in["i_model"])
+           .set_resin(resin)
+           .set_laminate(stack)
+           .set_pressures(p_inlet=p_in["p_inlet"], p_init=p_in["p_init"])
+           .set_air_eos(p_ref=p_in["p_ref"], rho_ref=p_in["rho_ref"],
+                        gamma=p_in["gamma_eos"])
+           .set_run_control(tmax=p_in["tmax"], n_pics=n_pics))
+    patch1 = p_in["patch_types"][0]
+    if patch1 == 1:
+        sim.add_injection_port_cells(inlet_cells, name="SET 1")
+    elif patch1 == 3:
+        sim.add_vent_cells(inlet_cells, name="SET 1")
+    return sim
 
 
 # ---------- plotting ----------
@@ -421,11 +406,16 @@ def main():
     print(f"  ply: t={pf['thickness']*1e3:.2f}mm, phi={pf['porosity']}, "
           f"K1={pf['K1']:.2e}, K2={pf['K2']:.2e}, refdir={pf['refdir']}")
 
-    cascade_cells, cascade_dist = find_cells_near_point(
-        mesh, CASCADE_POINT, CASCADE_RADIUS)
+    # Raw-point selection (no surface snap) keeps the original cell choice.
+    sim = build_simulation(mesh, p_in, inlet_cells)
+    sim.add_injection_port(CASCADE_POINT, t_activate=CASCADE_T_ACTIVATE,
+                           radius=CASCADE_RADIUS, name="cascade",
+                           snap_to_surface=False)
+    cascade = sim.get_ports()[-1]
+    cascade_cells = cascade.cells
     print(f"\nCascade injection at {CASCADE_POINT}:")
     print(f"  -> {cascade_cells.size} cell(s) within {CASCADE_RADIUS} m "
-          f"(closest at {cascade_dist*1e3:.2f} mm)")
+          f"(closest at {cascade.snap_distance*1e3:.2f} mm)")
     print(f"  -> activates at t = {CASCADE_T_ACTIVATE:.1f} s")
 
     plot_mesh_overview(nodes, tris, inlet_cells,
@@ -434,13 +424,9 @@ def main():
                        cascade_point=CASCADE_POINT,
                        cascade_t_activate=CASCADE_T_ACTIVATE)
 
-    params = build_params(
-        p_in,
-        cascade_events=[(CASCADE_T_ACTIVATE, cascade_cells)],
-    )
     print("\nRunning solver (first call may JIT-compile)...")
     t0 = time.time()
-    snaps = rtm.run_filling(mesh, params)
+    snaps = sim.run()
     print(f"  -> {time.time() - t0:.1f}s, {len(snaps)} snapshots")
 
     final = snaps[-1]

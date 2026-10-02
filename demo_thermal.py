@@ -3,10 +3,10 @@ RTMsim-Py demo: thermal + cure coupling (1D through-thickness model).
 
 Three runs on the same plate and stack:
 
-  (A) iso-thermal baseline: thermal_enabled=False — reference
-  (B) cold tool / hot resin: thermal_enabled=True, cure_enabled=False
+  (A) iso-thermal baseline: no set_thermal() — reference
+  (B) cold tool / hot resin: set_thermal(...), cure disabled
         → resin cools as it advances, viscosity climbs, fill front slows
-  (C) hot iso-T + cure:      thermal_enabled=True, cure_enabled=True,
+  (C) hot iso-T + cure:      set_thermal(...) + enable_cure(),
         T=120°C uniform → cure proceeds during filling; alpha map shows
         more advanced cure where resin sat longest.
 
@@ -38,36 +38,54 @@ K2_OVER_K1 = 0.2
 PHI = 0.55
 
 
-def make_ply(deg):
+AIR_EOS = dict(p_ref=1.01325e5, rho_ref=1.225, gamma=1.4)
+
+# Resin: constant mu for the iso-thermal run; Arrhenius/Castro-Macosko
+# viscosity and Kamal-Sourour cure for the thermal runs. The viscosity
+# model gives mu(T=333 K, alpha=0) ~ 0.10 Pa s, matching the baseline.
+RESIN = (rtm.ResinMaterial('epoxy')
+         .set_viscosity(0.10)
+         .set_density(960.0)
+         .set_thermal_properties(cp=1800.0, conductivity=0.2)
+         .set_viscosity_model(mu_inf=2.0e-6, E_mu=3.0e4, mu_max=1.0e3)
+         .set_gel_model(alpha_gel=0.6, C1=1.5, C2=1.0)
+         .set_cure_kinetics(H_total=350.0e3, A1=2.0e3, A2=2.0e5,
+                            E1=5.0e4, E2=6.0e4, m=0.5, n=1.5,
+                            alpha_init=0.0))
+FABRIC = (rtm.FabricMaterial('glass fabric')
+          .set_permeability(K1, K1 * K2_OVER_K1)
+          .set_porosity(PHI)
+          .set_thermal_properties(density=2540.0, cp=800.0, conductivity=1.0))
+
+
+def fibre_dir(deg):
     th = np.deg2rad(deg)
-    return rtm.PlyProperties(
-        thickness=T_PLY, porosity=PHI,
-        K1=K1, K2=K1 * K2_OVER_K1,
-        refdir=np.array([np.cos(th), np.sin(th), 0.0]),
-    )
+    return np.array([np.cos(th), np.sin(th), 0.0])
 
 
-def build_mesh(side=0.30, n_div=20, inlet_radius=0.02):
-    mesh = rtm.make_square_plate(side=side, n_div=n_div)
-    rtm.assign_patch_by_disk(mesh, 0, (0.0, 0.0), inlet_radius)
-    return mesh
+def build_mesh(side=0.30, n_div=20):
+    return rtm.ShellMesh.make_square_plate(side=side, n_div=n_div)
 
 
-def run_case(mesh, label, **overrides):
-    plies = [make_ply(a) for a in PLY_ANGLES]
-    stack = rtm.LaminateStack(plies=plies)
-    base = dict(
-        tmax=200.0, p_inlet=P_INLET, p_init=P_INIT,
-        mu_resin=0.10,                     # used only when thermal off
-        patch_types=[rtm.PATCH_INLET, rtm.PATCH_IGNORE,
-                     rtm.PATCH_IGNORE, rtm.PATCH_IGNORE],
-        n_pics=20, stack=stack,
-    )
-    base.update(overrides)
-    params = rtm.SimParameters(**base)
+def run_case(mesh, label, thermal=None, cure=False, inlet_radius=0.02):
+    """thermal: None (iso-thermal) or dict(T_init, T_inlet, T_tool, h_tool)."""
+    stack = rtm.LaminateStack()
+    for a in PLY_ANGLES:
+        stack.add_ply(FABRIC, T_PLY, fibre_dir(a))
+    sim = (rtm.RTMSimulation()
+           .set_mesh(mesh)
+           .set_process_model(1)
+           .set_resin(RESIN)
+           .set_laminate(stack)
+           .set_pressures(p_inlet=P_INLET, p_init=P_INIT)
+           .set_air_eos(**AIR_EOS)
+           .set_run_control(tmax=200.0, n_pics=20)
+           .add_injection_port((0.0, 0.0, 0.0), radius=inlet_radius))
+    if thermal is not None:
+        sim.set_thermal(**thermal).enable_cure(cure)
     print(f'  {label} ...')
     t0 = time.time()
-    snaps = rtm.run_filling(mesh, params)
+    snaps = sim.run()
     print(f'    -> {time.time() - t0:.1f}s, {len(snaps)} snapshots, '
           f't_final={snaps[-1].t:.1f}s')
     return snaps
@@ -197,17 +215,15 @@ def main(outdir):
 
     snaps_cold = run_case(
         mesh, 'cold-tool / hot resin',
-        thermal_enabled=True, cure_enabled=False,
-        T_init=298.15, T_inlet=353.15, T_tool=298.15,
-        h_tool=500.0,
+        thermal=dict(T_init=298.15, T_inlet=353.15, T_tool=298.15,
+                     h_tool=500.0),
     )
 
     snaps_cure = run_case(
         mesh, 'hot iso-T + cure',
-        thermal_enabled=True, cure_enabled=True,
-        T_init=393.15, T_inlet=393.15, T_tool=393.15,
-        h_tool=200.0,
-        # default Kamal-Sourour params + Castro-Macosko viscosity
+        thermal=dict(T_init=393.15, T_inlet=393.15, T_tool=393.15,
+                     h_tool=200.0),
+        cure=True,
     )
 
     plot_sequence(mesh, snaps_iso,

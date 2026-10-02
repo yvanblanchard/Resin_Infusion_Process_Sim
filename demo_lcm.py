@@ -48,39 +48,39 @@ K1 = 3e-10
 K2_OVER_K1 = 0.2
 
 
-def make_lcm_ply(deg):
+AIR_EOS = dict(p_ref=1.01325e5, rho_ref=1.225, gamma=1.4)
+RESIN = rtm.ResinMaterial('resin').set_viscosity(0.10).set_density(960.0)
+FABRIC = (rtm.FabricMaterial('compactable fabric')
+          .set_permeability(K1, K1 * K2_OVER_K1)
+          .set_porosity(PHI_0)
+          .set_compaction(porosity_at_p1=PHI_1, p1=P1))
+
+
+def fibre_dir(deg):
     th = np.deg2rad(deg)
-    return rtm.PlyProperties(
-        thickness=T_PLY,
-        porosity=PHI_0,
-        K1=K1, K2=K1 * K2_OVER_K1,
-        refdir=np.array([np.cos(th), np.sin(th), 0.0]),
-        porosity_at_p1=PHI_1, p1=P1,
-    )
+    return np.array([np.cos(th), np.sin(th), 0.0])
 
 
-def build_mesh_demo(side=0.30, n_div=20, inlet_radius=0.02):
-    mesh = rtm.make_square_plate(side=side, n_div=n_div)
-    rtm.assign_patch_by_disk(mesh, 0, (0.0, 0.0), inlet_radius)
-    return mesh
+def build_mesh_demo(side=0.30, n_div=20):
+    return rtm.ShellMesh.make_square_plate(side=side, n_div=n_div)
 
 
-def run_model(mesh, i_model, label):
-    plies = [make_lcm_ply(a) for a in PLY_ANGLES]
-    stack = rtm.LaminateStack(plies=plies)
-    params = rtm.SimParameters(
-        i_model=i_model,
-        tmax=200.0, mu_resin=0.10,
-        p_inlet=P_INLET, p_init=P_INIT,
-        rho_air=1.225, rho_resin=960.0,
-        patch_types=[rtm.PATCH_INLET, rtm.PATCH_IGNORE,
-                     rtm.PATCH_IGNORE, rtm.PATCH_IGNORE],
-        n_pics=20,
-        stack=stack,
-    )
+def run_model(mesh, i_model, label, inlet_radius=0.02):
+    stack = rtm.LaminateStack()
+    for a in PLY_ANGLES:
+        stack.add_ply(FABRIC, T_PLY, fibre_dir(a))
+    sim = (rtm.RTMSimulation()
+           .set_mesh(mesh)
+           .set_process_model(i_model)
+           .set_resin(RESIN)
+           .set_laminate(stack)
+           .set_pressures(p_inlet=P_INLET, p_init=P_INIT)
+           .set_air_eos(**AIR_EOS)
+           .set_run_control(tmax=200.0, n_pics=20)
+           .add_injection_port((0.0, 0.0, 0.0), radius=inlet_radius))
     print(f'  {label} (i_model={i_model})')
     t0 = time.time()
-    snaps = rtm.run_filling(mesh, params)
+    snaps = sim.run()
     print(f'    -> {time.time() - t0:.1f}s, {len(snaps)} snapshots')
     return snaps
 
