@@ -10,7 +10,8 @@ planes) on the tool, in two linked views:
          time, dry cells light grey, simulated flow front (black line),
          measured flow front of the nearest experimental time (orange line,
          draped onto the tool from the paper's plan-view data), inlet
-         (orange) and vent cells (dark grey)
+         (orange) and vent cells (dark grey; with --model 4 the vent cells
+         fill like the rest of the ply and are outlined instead)
   right  draped ply coloured by shear angle, with the K1 principal
          permeability direction of each element (Eq. 11 of the paper)
 
@@ -21,7 +22,9 @@ Run:
   python view_double_dome.py --case 45 --variant iso
   python view_double_dome.py --off-screen --time 1255   # PNG only
   python view_double_dome.py --tmax 4000           # run on to the end of fill
-Options: --geometry stl|parametric (default stl), --spacing 10 [mm].
+  python view_double_dome.py --model 4 --variant shear_warp
+Options: --geometry stl|parametric (default stl), --spacing 10 [mm],
+         --model 2|4 (default 2; 4 = incompressible resin).
 
 The default run stops just after the last measured time (1795 / 1340 s),
 before the far ends of the ply are reached.
@@ -123,19 +126,21 @@ def drape_plan_curve(curve, step=2.0):
 # Case
 # --------------------------------------------------------------------------
 class Case:
-    def __init__(self, case_key, variant, spacing, tmax=None):
+    def __init__(self, case_key, variant, spacing, tmax=None, model=2):
         self.key = case_key
         self.case = vdd.CASES[case_key]
         self.tmax = tmax or self.case["tmax"]
         self.variant = variant
+        self.model = model
         self.paper = vdd.PAPER[case_key]
         self.drape = dr = vdd.drape_ply(self.case["fibre_deg"], spacing)
         mesh = rtm.ShellMesh.from_arrays(dr["xyz"], dr["tris"], scale=1e-3,
                                          units="mm")
-        sim = vdd.build_sim(mesh, dr, self.case["mu"], self.tmax,
-                            2, variant == "shear")
-        print(f"Running {self.case['label']}, {variant} K, {mesh.N} cells "
-              f"(quarter)...")
+        shear_dep, k1_on = vdd.VARIANTS[variant]
+        sim = vdd.build_sim(mesh, dr, self.case["mu"], self.tmax, model,
+                            shear_dep, k1_on)
+        print(f"Running {self.case['label']}, {variant} K, i_model={model}, "
+              f"{mesh.N} cells (quarter)...")
         self.fill_time_q = vdd.run_sim(sim, variant)
         self.vent_cells_q = np.concatenate(
             [p.cells for p in sim.get_ports() if p.kind == "vent"])
@@ -149,11 +154,14 @@ class Case:
         self.poly.cell_data["shear angle [deg]"] = np.abs(dr["shear"])[self.src]
         self.poly.points = lift(self.poly.points, PLY_OFFSET)
         self.tm = trimesh.Trimesh(self.poly.points, faces, process=False)
-        # Vent cells are pinned at the outlet pressure by the solver and
-        # never fill: drawn as their own category, not counted as dry ply.
+        # i_model 2: vent cells are pinned at the outlet pressure and never
+        # fill, so they are drawn as their own category, not counted as dry
+        # ply. i_model 4: they fill like the rest (outlet on the ply edge).
         self.vent = np.isin(self.src, self.vent_cells_q)
+        if model == 4:
+            self.vent[:] = False
 
-        e1 = mirror_vectors(vdd.k1_direction(dr))
+        e1 = mirror_vectors(vdd.k1_direction(dr, k1_on or "weft"))
         centres = lift(self.poly.cell_centers().points, 2.0)
         half = 0.4 * spacing
         seg = np.empty((2 * len(centres), 3))
@@ -184,6 +192,10 @@ class Case:
         ids_full = lambda q: np.where(np.isin(self.src, q))[0]
         inlet = self.poly.extract_cells(ids_full(self.inlet_cells_q))
         vent = self.poly.extract_cells(ids_full(self.vent_cells_q))
+        if self.model == 4:
+            vent = vent.extract_feature_edges(boundary_edges=True,
+                                              feature_edges=False,
+                                              manifold_edges=False)
         return inlet, vent
 
 
@@ -246,9 +258,10 @@ def build_plotter(cs, t0, off_screen, geom_label):
     pl.set_background(SURFACE)
     tool = tool_surface()
     inlet, vent = cs.port_meshes()
+    k_label = {"iso": "isotropic K", "shear": "shear-dependent K",
+               "shear_warp": "shear-dependent K, K1 from the warp"}
     title = (f"Double dome, {cs.case['label']} sample, "
-             f"{'shear-dependent' if cs.variant == 'shear' else 'isotropic'} "
-             f"K, {geom_label}")
+             f"{k_label[cs.variant]}, i_model={cs.model}, {geom_label}")
 
     # ---- right: shear map + K1 directions (static) ----
     pl.subplot(0, 1)
@@ -277,12 +290,17 @@ def build_plotter(cs, t0, off_screen, geom_label):
                                             feature_edges=False,
                                             manifold_edges=False),
                 color=EXP, line_width=4)
-    pl.add_mesh(vent, color=VENT, **SHADING)
+    if cs.model == 4:
+        pl.add_mesh(vent, color=VENT, line_width=3)
+        vent_entry = ("vent, fills, held at 0.3 kPa", VENT, LINE_FACE)
+    else:
+        pl.add_mesh(vent, color=VENT, **SHADING)
+        vent_entry = ("vent, held at 0.3 kPa (never fills)", VENT, AREA_FACE)
     add_legend_box(pl, [
         ("simulated flow front (RTMsim-Py)", INK, LINE_FACE),
         ("measured flow front, Pierce & Falzon 2017", EXP, LINE_FACE),
         ("inlet (50 mm diameter)", EXP, DOT_FACE),
-        ("vent, held at 0.3 kPa (never fills)", VENT, AREA_FACE),
+        vent_entry,
         ("dry ply", DRY, AREA_FACE),
         ("tool surface", TOOL, AREA_FACE)],
         position=(0.55, 0.72), size=(0.43, 0.2))
@@ -330,7 +348,7 @@ def build_plotter(cs, t0, off_screen, geom_label):
             exp_txt = "past the last measured time, no measured front"
         pct = 100.0 * filled[~cs.vent].mean()
         pl.add_text(f"{title}\nt = {t:.0f} s, {pct:.0f} % of the ply "
-                    f"(without vents) filled; {exp_txt}",
+                    f"{'(without vents) ' if cs.model != 4 else ''}filled; {exp_txt}",
                     position="upper_left", font_size=11, color=INK,
                     name="time_text")
 
@@ -364,7 +382,9 @@ def build_plotter(cs, t0, off_screen, geom_label):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--case", choices=list(vdd.CASES), default="0_90")
-    ap.add_argument("--variant", choices=("shear", "iso"), default="shear")
+    ap.add_argument("--variant", choices=list(vdd.VARIANTS), default="shear")
+    ap.add_argument("--model", type=int, choices=(2, 4), default=2,
+                    help="process model (4: incompressible resin)")
     ap.add_argument("--geometry", choices=("stl", "parametric"), default="stl")
     ap.add_argument("--stl", default=vdd.STL_DEFAULT)
     ap.add_argument("--spacing", type=float, default=10.0)
@@ -384,13 +404,14 @@ def main():
         vdd._TOOL = vdd.StlTool(args.stl)
     geom_label = ("benchmark STL tool x2" if args.geometry == "stl"
                   else "parametric tool")
-    cs = Case(args.case, args.variant, args.spacing, args.tmax)
+    cs = Case(args.case, args.variant, args.spacing, args.tmax, args.model)
     t0 = args.time if args.time is not None else cs.paper["times"][-1]
 
     outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "output_validation_double_dome", args.geometry)
     os.makedirs(outdir, exist_ok=True)
-    out = os.path.join(outdir, f"view_{args.case}_{args.variant}.png")
+    tag = "" if args.model == 2 else f"_model{args.model}"
+    out = os.path.join(outdir, f"view_{args.case}_{args.variant}{tag}.png")
     pl = build_plotter(cs, t0, args.off_screen, geom_label)
     if args.off_screen:
         pl.screenshot(out)

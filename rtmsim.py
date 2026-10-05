@@ -2,7 +2,7 @@
 RTMsim-Py: Python port of RTMsim/LCMsim (Obertscheider et al., FHWN).
 
 Finite Area Method solver for LCM filling simulation on triangle shell
-meshes. Three process models are supported:
+meshes. Four process models are supported:
 
     i_model=1  RTM (resin transfer molding), iso-thermal compressible
                Euler + Darcy drag + smooth VOF, quadratic-fit EOS.
@@ -14,6 +14,18 @@ meshes. Three process models are supported:
                compaction). Per-ply quadratic phi(p) = phi0 + c*p^2;
                permeability scales by Carman-Kozeny-like factor
                phi^3/(1-phi)^2.
+    i_model=4  incompressible resin, Darcy flow (isothermal, rigid
+               preform). Each step solves div(h K/mu grad p) = 0 on the
+               full cells (finite volumes, two-point flux plus an implicit
+               least-squares correction for skewed cells and anisotropic
+               K) with p_inlet on the inlet port boundary, p_vent on the
+               outer edges of full vent cells and p_init (or the air
+               pocket pressure) in the cells not yet full; the fill factor
+               f of those cells then advances with the Darcy inflow,
+               phi V df/dt = Q. f does not depend on pressure, so the
+               cells next to the vents fill. Air cut off from the vents is
+               an isothermal ideal gas (p V = const) and can end as a dry
+               spot. Needs scipy; no air EOS.
 
 Object model
 ------------
@@ -524,8 +536,35 @@ class SolverSettings:
                              faster on few threads: waking threads costs more
                              than the work. Results do not depend on it.
       cells_per_thread       cell count per thread for n_threads=None
+    Incompressible model (i_model 4)
+      linear_solver          "auto", "direct" (SuperLU) or "iterative"
+                             (ILU-preconditioned BiCGSTAB from the previous
+                             pressure); "auto" is direct up to
+                             direct_max_cells unknowns
+      direct_max_cells       unknown count above which "auto" goes iterative
+      iterative_rtol         relative residual of the iterative solve
+      flux_correction        True: the flux includes the non-orthogonal /
+                             anisotropic part (K n not along the cell-to-face
+                             line) from the least-squares pressure gradient,
+                             implicitly; False: two-point flux only
+                             (inconsistent on skewed cells or anisotropic K,
+                             for comparison)
+      fill_fraction_per_step a step ends when this fraction of the front
+                             cells is full (at least one cell); resin beyond
+                             f = 1 passes to the dry neighbours. 0 = one
+                             cell per step (slowest, exact event order)
+      fill_tol               a cell with f >= 1 - fill_tol counts as full
+      pocket_tol             the run ends with dry spots once nothing else
+                             can fill and every air pocket's gas pressure is
+                             within pocket_tol x (p_inlet - p_init) of the
+                             resin pressure around it
+      pocket_min_cells       an air pocket holding less than this many
+                             cells of air when it forms is below mesh
+                             resolution and fills as if vented
     Termination / post-processing
       fill_stop_fraction     stop when the mean fill fraction exceeds this
+                             (i_model 1-3; i_model 4 stops when every cell
+                             is full)
       fill_time_threshold    gamma at which a cell counts as filled (fill-time field)
     """
 
@@ -556,6 +595,14 @@ class SolverSettings:
         fill_time_threshold=0.5,
         n_threads=None,
         cells_per_thread=500,
+        linear_solver="auto",
+        direct_max_cells=50000,
+        iterative_rtol=1e-10,
+        flux_correction=True,
+        fill_fraction_per_step=0.1,
+        fill_tol=1e-12,
+        pocket_tol=1e-3,
+        pocket_min_cells=1.0,
     )
 
     def __init__(self, **overrides):
@@ -580,6 +627,12 @@ class SolverSettings:
                                f"valid: {sorted(self._DEFAULTS)}")
             if k == "h_min_mode" and v not in ("min", "percentile"):
                 raise ValueError("h_min_mode must be 'min' or 'percentile'")
+            if k == "linear_solver" and v not in ("auto", "direct",
+                                                  "iterative"):
+                raise ValueError("linear_solver must be 'auto', 'direct' or "
+                                 "'iterative'")
+            if k == "fill_fraction_per_step" and not 0.0 <= v < 1.0:
+                raise ValueError("fill_fraction_per_step must be in [0, 1)")
             self._values[k] = v
         return self
 
@@ -1906,6 +1959,493 @@ def _eigmax_K(Kxx, Kxy, Kyy):
 
 
 # --------------------------------------------------------------------------
+# Incompressible model (i_model=4): Darcy pressure solve + fill factors
+# --------------------------------------------------------------------------
+# Cell states
+M4_OPEN = 0        # not full: held at p_init (or its air pocket pressure)
+M4_FULL = 1        # full: pressure unknown
+M4_INLET = 2       # injection port: resin reservoir at p_inlet
+M4_HOLE = 3        # vent port inside the part: reservoir at p_vent
+
+# Air pockets: per step the air volume may shrink by at most this fraction
+# (the implicit pocket pressure linearises p V = const over the step).
+_POCKET_MAX_SHRINK = 0.5
+
+
+@dataclass
+class FaceGeom:
+    """
+    Faces between neighbour cells for the incompressible model; side 0 is
+    cell fi, side 1 cell fj (fi < fj). Per side, in that cell's frame:
+
+      tau   half transmissibility h L |K n| / (|d| mu)        [m^3/(Pa s)]
+      tau_n half transmissibility h L (n.K n) / ((d.n) mu) of a front face:
+            pressure gradient normal to the face (the face is the front)
+      sx/sy non-orthogonal part (h L / mu)(K n - |K n| d / |d|); the side's
+            correction flux is -(s . grad p)
+      dx/dy cell centre to edge midpoint [m]
+      ox/oy cell centre to the neighbour's centre, unfolded about the edge
+            into this cell's plane [m]
+
+    slot_face / slot_side (N, K) give the face id and side of neighbour
+    slot k of each cell.
+    """
+    fi: np.ndarray
+    fj: np.ndarray
+    tau: np.ndarray
+    tau_n: np.ndarray
+    sx: np.ndarray
+    sy: np.ndarray
+    dx: np.ndarray
+    dy: np.ndarray
+    ox: np.ndarray
+    oy: np.ndarray
+    slot_face: np.ndarray
+    slot_side: np.ndarray
+
+    def per_slot(self, a):
+        """(N, K) array of a per-side face quantity (nf, 2), by neighbour slot."""
+        out = np.zeros(self.slot_face.shape)
+        has = self.slot_face >= 0
+        out[has] = a[self.slot_face[has], self.slot_side[has]]
+        return out
+
+    @property
+    def T(self):
+        """Face transmissibility, harmonic mean of the two sides."""
+        return self.tau[:, 0] * self.tau[:, 1] / (self.tau[:, 0] + self.tau[:, 1])
+
+
+def build_face_geometry(mesh, neighbours, thickness, Kxx, Kxy, Kyy, viscosity):
+    """
+    Two-point flux geometry of every face (see FaceGeom). Each side is
+    built in its own cell's plane (centroid, edge midpoint, in-plane edge
+    normal and that cell's K tensor), so curved shells need no unfolding,
+    and the harmonic mean of the sides joins cells of different K or
+    thickness. K n is split as |K n| d/|d| (two-point part, "orthogonal
+    correction" split) plus a remainder taken from the least-squares
+    pressure gradient (see _m4_assemble).
+    """
+    N = mesh.N
+    ii, kk = np.nonzero(neighbours >= 0)
+    jj = neighbours[ii, kk]
+    key = np.minimum(ii, jj) * N + np.maximum(ii, jj)
+    fkey = np.unique(key)
+    fi, fj = fkey // N, fkey % N
+    slot_face = np.full(neighbours.shape, -1, dtype=np.int64)
+    slot_side = np.zeros(neighbours.shape, dtype=np.int64)
+    slot_face[ii, kk] = np.searchsorted(fkey, key)
+    slot_side[ii, kk] = (ii > jj).astype(np.int64)
+
+    cg = mesh.cellgridid
+    shared = (cg[fi][:, :, None] == cg[fj][:, None, :]).any(axis=2)
+    if not np.all(shared.sum(axis=1) == 2):
+        raise RuntimeError("neighbour cells must share exactly one edge")
+    ab = cg[fi][shared].reshape(-1, 2)
+    frames = element_frames(mesh)
+    nf = fi.size
+    tau, tau_n, sx, sy, dx, dy = (np.empty((nf, 2)) for _ in range(6))
+    for side, c in enumerate((fi, fj)):
+        (tau[:, side], tau_n[:, side], sx[:, side], sy[:, side], dx[:, side],
+         dy[:, side]) = _half_faces(mesh, frames, c, ab, thickness, Kxx, Kxy,
+                                    Kyy, viscosity)
+    # Neighbour centroid unfolded about the shared edge into each side's
+    # plane (for the least-squares gradient on curved shells).
+    dot = lambda a, b: np.einsum("ij,ij->i", a, b)
+    xa, xb = mesh.nodes[ab[:, 0]], mesh.nodes[ab[:, 1]]
+    mid = 0.5 * (xa + xb)
+    eh = (xb - xa) / np.linalg.norm(xb - xa, axis=1)[:, None]
+    ox, oy = np.empty((nf, 2)), np.empty((nf, 2))
+    for side, (c, o) in enumerate(((fi, fj), (fj, fi))):
+        d3 = mid - mesh.cellcenter[c]
+        n3 = d3 - dot(d3, eh)[:, None] * eh
+        n3 /= np.linalg.norm(n3, axis=1)[:, None]
+        r = mesh.cellcenter[o] - mid
+        along = dot(r, eh)
+        perp = np.linalg.norm(r - along[:, None] * eh, axis=1)
+        flat = d3 + along[:, None] * eh + perp[:, None] * n3
+        ox[:, side], oy[:, side] = dot(flat, frames[0][c]), dot(flat, frames[1][c])
+    return FaceGeom(fi=fi, fj=fj, tau=tau, tau_n=tau_n, sx=sx, sy=sy, dx=dx,
+                    dy=dy, ox=ox, oy=oy, slot_face=slot_face,
+                    slot_side=slot_side)
+
+
+def _half_faces(mesh, frames, c, ab, thickness, Kxx, Kxy, Kyy, viscosity):
+    """(tau, tau_n, sx, sy, dx, dy) of the edges ab (node pairs) seen from cells c."""
+    e1, e2 = frames[0], frames[1]
+    xa, xb = mesh.nodes[ab[:, 0]], mesh.nodes[ab[:, 1]]
+    L = np.linalg.norm(xb - xa, axis=1)
+    eh = (xb - xa) / L[:, None]
+    dot = lambda a, b: np.einsum("ij,ij->i", a, b)
+    d3 = 0.5 * (xa + xb) - mesh.cellcenter[c]
+    n3 = d3 - dot(d3, eh)[:, None] * eh
+    n3 /= np.linalg.norm(n3, axis=1)[:, None]
+    dx, dy = dot(d3, e1[c]), dot(d3, e2[c])
+    nx, ny = dot(n3, e1[c]), dot(n3, e2[c])
+    wx = Kxx[c] * nx + Kxy[c] * ny
+    wy = Kxy[c] * nx + Kyy[c] * ny
+    alpha = np.hypot(wx, wy) / np.hypot(dx, dy)
+    a = thickness[c] * L / viscosity[c]
+    tau_n = a * (nx * wx + ny * wy) / (nx * dx + ny * dy)
+    return (a * alpha, tau_n, a * (wx - alpha * dx), a * (wy - alpha * dy),
+            dx, dy)
+
+
+def build_outlet_edges(mesh, cells, thickness, Kxx, Kxy, Kyy, viscosity):
+    """
+    Mesh boundary edges of `cells` (the outlet faces of a vent along the
+    part edge): returns (cell, tau, sx, sy) per edge, same meaning as in
+    FaceGeom.
+    """
+    cg = mesh.cellgridid
+    edges = cg[:, [0, 1, 1, 2, 0, 2]].reshape(-1, 2)
+    rows = trimesh.grouping.group_rows(edges, require_count=1)
+    rows = np.asarray(rows, dtype=np.int64).ravel()
+    owner = rows // 3
+    keep = np.isin(owner, cells)
+    rows, owner = rows[keep], owner[keep]
+    tau, _, sx, sy, _, _ = _half_faces(mesh, element_frames(mesh), owner,
+                                    edges[rows], thickness, Kxx, Kxy, Kyy,
+                                    viscosity)
+    return owner, tau, sx, sy
+
+
+@njit(cache=True)
+def _m4_lsq_weights(nbrs, ccx, ccy, slot_face, slot_side, fdx, fdy, state):
+    """
+    Least-squares gradient weights, grad p_i = sum_k W[i,k] (p_k - p_i).
+    An inlet / hole neighbour enters at the shared edge midpoint (the
+    reservoir pressure acts on the port boundary).
+    """
+    N, K = nbrs.shape
+    Wx = np.zeros((N, K))
+    Wy = np.zeros((N, K))
+    ox = np.empty(K)
+    oy = np.empty(K)
+    for i in range(N):
+        a = 0.0
+        b = 0.0
+        d = 0.0
+        n = 0
+        for k in range(K):
+            j = nbrs[i, k]
+            if j < 0:
+                break
+            if state[j] == M4_INLET or state[j] == M4_HOLE:
+                ox[k] = fdx[slot_face[i, k], slot_side[i, k]]
+                oy[k] = fdy[slot_face[i, k], slot_side[i, k]]
+            else:
+                ox[k] = ccx[i, k]
+                oy[k] = ccy[i, k]
+            a += ox[k] * ox[k]
+            b += ox[k] * oy[k]
+            d += oy[k] * oy[k]
+            n += 1
+        det = a * d - b * b
+        if n < 2 or det <= 1e-12 * a * d:
+            continue
+        inv = 1.0 / det
+        for k in range(K):
+            if nbrs[i, k] < 0:
+                break
+            Wx[i, k] = inv * (d * ox[k] - b * oy[k])
+            Wy[i, k] = inv * (-b * ox[k] + a * oy[k])
+    return Wx, Wy
+
+
+@njit(cache=True)
+def _m4_gradient(nbrs, Wx, Wy, p, state, gx, gy):
+    """Pressure gradient of the full cells (zero elsewhere), in place."""
+    N, K = nbrs.shape
+    for i in range(N):
+        sx = 0.0
+        sy = 0.0
+        if state[i] == M4_FULL:
+            for k in range(K):
+                j = nbrs[i, k]
+                if j < 0:
+                    break
+                dp = p[j] - p[i]
+                sx += Wx[i, k] * dp
+                sy += Wy[i, k] * dp
+        gx[i] = sx
+        gy[i] = sy
+
+
+@njit(cache=True)
+def _m4_face_weights(si, sj, ti, tj, ni, nj, correct):
+    """
+    Face transmissibility T and the weights (wi, wj) of the two sides'
+    correction fluxes in the face flux T (p_i - p_j) + wi c_i - wj c_j
+    (from flux continuity at the face). A reservoir side (inlet / hole)
+    has its pressure on the face: only the other side counts. Corrections
+    exist between wet cells only. A front face (one side open) is a piece
+    of the front: two-point flux with the pressure gradient normal to it
+    (ni, nj = tau_n), which never pushes resin out of a front cell.
+    """
+    if si == M4_OPEN or sj == M4_OPEN:
+        ti, tj = ni, nj
+    res_i = si == M4_INLET or si == M4_HOLE
+    res_j = sj == M4_INLET or sj == M4_HOLE
+    if res_i:
+        T, wi, wj = tj, 0.0, 1.0
+    elif res_j:
+        T, wi, wj = ti, 1.0, 0.0
+    else:
+        T, wi, wj = ti * tj / (ti + tj), tj / (ti + tj), ti / (ti + tj)
+    if not correct or si != M4_FULL or sj == M4_OPEN:
+        wi = 0.0
+    if not correct or sj != M4_FULL or si == M4_OPEN:
+        wj = 0.0
+    return T, wi, wj
+
+
+@njit(cache=True)
+def _m4_has_flux(si, sj):
+    """Faces carry flux unless both sides are open or both are reservoirs."""
+    if si == M4_OPEN and sj == M4_OPEN:
+        return False
+    res_i = si == M4_INLET or si == M4_HOLE
+    res_j = sj == M4_INLET or sj == M4_HOLE
+    return not (res_i and res_j)
+
+
+@njit(cache=True)
+def _m4_add(row, cell, coef, uid, p, rows, cols, vals, rhs, nnz):
+    """Add coef * p[cell] to equation `row`: matrix entry or known value."""
+    u = uid[cell]
+    if u >= 0:
+        rows[nnz] = row
+        cols[nnz] = u
+        vals[nnz] = coef
+        return nnz + 1
+    rhs[row] -= coef * p[cell]
+    return nnz
+
+
+@njit(cache=True)
+def _m4_assemble(fi, fj, tau, tau_n, sx, sy, oc, otau, osx, osy, nbrs, Wx, Wy,
+                 state, uid, p, n_unk, p_vent, correct):
+    """
+    Darcy pressure system: for every unknown, the sum of its outgoing
+    fluxes is zero. A face flux is
+
+        F = T (p_i - p_j) + wi c_i - wj c_j,   c = -(s . grad p)
+
+    (see _m4_face_weights), with grad p the least-squares gradient, linear
+    in the neighbour pressures, so the non-orthogonal / anisotropic part is
+    implicit too and no deferred iteration is needed. Outlet edges
+    (oc, ...) of full vent cells carry To (p_c - p_vent) + c_e. Unknowns
+    are the full cells and the air pockets (uid >= 0; pocket capacitance
+    added by the caller); other pressures in p are known. The matrix is
+    not symmetric. Returns COO arrays and the right-hand side.
+    """
+    nf = fi.size
+    K = nbrs.shape[1]
+    size = 2 * nf * (2 + 4 * (K + 1)) + oc.size * 2 * (K + 1) + 1
+    rows = np.empty(size, dtype=np.int64)
+    cols = np.empty(size, dtype=np.int64)
+    vals = np.empty(size)
+    rhs = np.zeros(n_unk)
+    nnz = 0
+    for f in range(nf):
+        i = fi[f]
+        j = fj[f]
+        si = state[i]
+        sj = state[j]
+        if not _m4_has_flux(si, sj):
+            continue
+        T, wi, wj = _m4_face_weights(si, sj, tau[f, 0], tau[f, 1],
+                                     tau_n[f, 0], tau_n[f, 1], correct)
+        for side in range(2):
+            row = uid[i] if side == 0 else uid[j]
+            if row < 0:
+                continue
+            sg = 1.0 if side == 0 else -1.0      # +F for i, -F for j
+            nnz = _m4_add(row, i, sg * T, uid, p, rows, cols, vals, rhs, nnz)
+            nnz = _m4_add(row, j, -sg * T, uid, p, rows, cols, vals, rhs, nnz)
+            if wi != 0.0:
+                for k in range(K):
+                    n = nbrs[i, k]
+                    if n < 0:
+                        break
+                    a = -sg * wi * (sx[f, 0] * Wx[i, k] + sy[f, 0] * Wy[i, k])
+                    nnz = _m4_add(row, n, a, uid, p, rows, cols, vals, rhs,
+                                  nnz)
+                    nnz = _m4_add(row, i, -a, uid, p, rows, cols, vals, rhs,
+                                  nnz)
+            if wj != 0.0:
+                for k in range(K):
+                    n = nbrs[j, k]
+                    if n < 0:
+                        break
+                    a = sg * wj * (sx[f, 1] * Wx[j, k] + sy[f, 1] * Wy[j, k])
+                    nnz = _m4_add(row, n, a, uid, p, rows, cols, vals, rhs,
+                                  nnz)
+                    nnz = _m4_add(row, j, -a, uid, p, rows, cols, vals, rhs,
+                                  nnz)
+    for e in range(oc.size):
+        c = oc[e]
+        if state[c] != M4_FULL:
+            continue
+        row = uid[c]
+        nnz = _m4_add(row, c, otau[e], uid, p, rows, cols, vals, rhs, nnz)
+        rhs[row] += otau[e] * p_vent
+        if correct:
+            for k in range(K):
+                n = nbrs[c, k]
+                if n < 0:
+                    break
+                a = -(osx[e] * Wx[c, k] + osy[e] * Wy[c, k])
+                nnz = _m4_add(row, n, a, uid, p, rows, cols, vals, rhs, nnz)
+                nnz = _m4_add(row, c, -a, uid, p, rows, cols, vals, rhs, nnz)
+    return rows[:nnz], cols[:nnz], vals[:nnz], rhs
+
+
+@njit(cache=True)
+def _m4_face_terms(fi, fj, tau, tau_n, sx, sy, oc, otau, osx, osy, state, gx, gy,
+                   correct):
+    """
+    Per face (T, g) and per outlet edge (To, go) of the flux, from the
+    gradient of the solved pressure: the same fluxes as _m4_assemble.
+    """
+    nf = fi.size
+    Tf = np.zeros(nf)
+    gf = np.zeros(nf)
+    for f in range(nf):
+        i = fi[f]
+        j = fj[f]
+        si = state[i]
+        sj = state[j]
+        if not _m4_has_flux(si, sj):
+            continue
+        T, wi, wj = _m4_face_weights(si, sj, tau[f, 0], tau[f, 1],
+                                     tau_n[f, 0], tau_n[f, 1], correct)
+        ci = -(sx[f, 0] * gx[i] + sy[f, 0] * gy[i])
+        cj = -(sx[f, 1] * gx[j] + sy[f, 1] * gy[j])
+        Tf[f] = T
+        gf[f] = wi * ci - wj * cj
+    To = np.zeros(oc.size)
+    go = np.zeros(oc.size)
+    for e in range(oc.size):
+        c = oc[e]
+        if state[c] != M4_FULL:
+            continue
+        To[e] = otau[e]
+        if correct:
+            go[e] = -(osx[e] * gx[c] + osy[e] * gy[c])
+    return Tf, gf, To, go
+
+
+@njit(cache=True)
+def _m4_net_inflow(fi, fj, Tf, gf, oc, To, go, p, p_vent, N):
+    """Net Darcy inflow [m^3/s] of every cell, and the outlet-edge outflow."""
+    Q = np.zeros(N)
+    for f in range(fi.size):
+        F = Tf[f] * (p[fi[f]] - p[fj[f]]) + gf[f]
+        Q[fj[f]] += F
+        Q[fi[f]] -= F
+    q_out = 0.0
+    for e in range(oc.size):
+        F = To[e] * (p[oc[e]] - p_vent) + go[e]
+        Q[oc[e]] -= F
+        q_out += F
+    return Q, q_out
+
+
+@njit(cache=True)
+def _m4_spill(excess, f, phiV, take, state, tau_out, nbrs, slot_face, Tgeo,
+              Q, f_full):
+    """
+    Pass resin beyond f = 1 on to the open neighbours that may take it
+    (take: open cells outside air pockets) and, for a vent cell,
+    out through its outlet edges (weighted by transmissibility), cascading
+    through cells that fill in turn. A cell with neither hands it to the
+    whole front in proportion to the inflow Q. Updates f and state in
+    place; returns (vented, spilled) volumes, spilled being resin with
+    nowhere to go (no open cell left).
+    """
+    N, K = nbrs.shape
+    stack = np.empty(N, dtype=np.int64)
+    n = 0
+    for c in range(N):
+        if excess[c] > 0.0:
+            stack[n] = c
+            n += 1
+    vented = 0.0
+    spilled = 0.0
+    while n > 0:
+        n -= 1
+        c = stack[n]
+        E = excess[c]
+        excess[c] = 0.0
+        if E <= 0.0:
+            continue
+        W = tau_out[c]
+        for k in range(K):
+            j = nbrs[c, k]
+            if j < 0:
+                break
+            if take[j]:
+                W += Tgeo[slot_face[c, k]]
+        if W > 0.0:
+            vented += E * tau_out[c] / W
+            for k in range(K):
+                j = nbrs[c, k]
+                if j < 0:
+                    break
+                if not take[j]:
+                    continue
+                f[j] += E * Tgeo[slot_face[c, k]] / W / phiV[j]
+                if f[j] >= f_full:
+                    if excess[j] == 0.0:
+                        stack[n] = j
+                        n += 1
+                    excess[j] += (f[j] - 1.0) * phiV[j]
+                    f[j] = 1.0
+                    take[j] = False
+                    state[j] = M4_FULL
+            continue
+        W = 0.0
+        for j in range(N):
+            if take[j] and Q[j] > 0.0:
+                W += Q[j]
+        if W <= 0.0:
+            spilled += E
+            continue
+        for j in range(N):
+            if not take[j] or Q[j] <= 0.0:
+                continue
+            f[j] += E * Q[j] / W / phiV[j]
+            if f[j] >= f_full:
+                if excess[j] == 0.0:
+                    stack[n] = j
+                    n += 1
+                excess[j] += (f[j] - 1.0) * phiV[j]
+                f[j] = 1.0
+                take[j] = False
+                state[j] = M4_FULL
+    return vented, spilled
+
+
+def _m4_linear_solve(rows, cols, vals, rhs, n, x0, method, rtol):
+    """Solve the pressure system (SuperLU, or ILU-preconditioned BiCGSTAB)."""
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    A = sp.csc_matrix((vals, (rows, cols)), shape=(n, n))
+    if method == "direct":
+        return spla.splu(A, permc_spec="MMD_AT_PLUS_A").solve(rhs)
+    ilu = spla.spilu(A, drop_tol=1e-5, fill_factor=10)
+    M = spla.LinearOperator((n, n), ilu.solve)
+    x, info = spla.bicgstab(A, rhs, x0=x0, rtol=rtol, M=M,
+                            maxiter=max(1000, n))
+    if info != 0:
+        warnings.warn(f"i_model=4: BiCGSTAB did not converge (info {info})",
+                      RuntimeWarning, stacklevel=3)
+    return x
+
+
+# --------------------------------------------------------------------------
 # Simulation
 # --------------------------------------------------------------------------
 class RTMSimulation:
@@ -1914,7 +2454,8 @@ class RTMSimulation:
     run(), read results with get_*.
 
     Required inputs: mesh, process model, resin, laminate, pressures, air
-    EOS, run control and at least one injection port active at t = 0.
+    EOS (not for i_model 4), run control and at least one injection port
+    active at t = 0.
     Thermal (set_thermal) and cure (enable_cure) are optional.
 
     Laminate: set_laminate() gives the default stack of every element;
@@ -1948,6 +2489,7 @@ class RTMSimulation:
         self._fill_region = None
         self._fill_complete = False
         self._t_end = None
+        self._m4_info = None
 
     # ------------------------------------------------------------------
     # Setters
@@ -1961,9 +2503,12 @@ class RTMSimulation:
         return self
 
     def set_process_model(self, i_model):
-        """1 = RTM, 2 = RTM-VARI two-fluid, 3 = VARI compactable preform."""
-        if i_model not in (1, 2, 3):
-            raise ValueError("i_model must be 1, 2, or 3")
+        """
+        1 = RTM, 2 = RTM-VARI two-fluid, 3 = VARI compactable preform,
+        4 = incompressible resin (Darcy pressure solve + fill factors).
+        """
+        if i_model not in (1, 2, 3, 4):
+            raise ValueError("i_model must be 1, 2, 3 or 4")
         self._i_model = int(i_model)
         return self
 
@@ -2212,7 +2757,8 @@ class RTMSimulation:
              self._stack if self._stack is not None
              else (self._laminate_regions or None)),
             ("pressures (set_pressures)", self._p_inlet),
-            ("air EOS (set_air_eos)", self._air),
+            ("air EOS (set_air_eos)",
+             self._air if self._i_model != 4 else True),
             ("run control (set_run_control)", self._tmax),
         ) if v is None]
         if not any(p.kind == "inlet" and p.t_activate == 0.0
@@ -2222,6 +2768,9 @@ class RTMSimulation:
         thermal = self._thermal is not None
         if self._cure_enabled and not thermal:
             raise ValueError("enable_cure requires set_thermal()")
+        if self._i_model == 4 and thermal:
+            raise ValueError("i_model=4 is isothermal: remove set_thermal() "
+                             "(disable_thermal())")
         self._resin.validate(self._i_model, thermal=thermal,
                              cure=self._cure_enabled)
         N = self._mesh.N
@@ -2317,6 +2866,8 @@ class RTMSimulation:
         """
         self.validate()
         self._clear_results()
+        if self._i_model == 4:
+            return self._run_incompressible(on_snapshot)
         st = self._settings
         mesh = self._mesh
         resin = self._resin
@@ -2331,32 +2882,8 @@ class RTMSimulation:
         N = mesh.N
 
         neighbours, celltype = create_faces(mesh, st.max_neighbours)
-        inlet_cells_all = []
-        cascade_events = []
-        for port in self._ports:
-            if port.kind == "vent":
-                celltype[port.cells] = CELL_OUTLET
-            elif port.t_activate == 0.0:
-                celltype[port.cells] = CELL_INLET
-                inlet_cells_all.append(port.cells)
-            else:
-                cascade_events.append((port.t_activate, port.cells))
-                inlet_cells_all.append(port.cells)
-        if not (celltype == CELL_INLET).any():
-            raise RuntimeError("No inlet cells defined")
-
-        # Bodies without any injection port can never fill: warn and leave
-        # them out of the fill criterion.
-        body = mesh.get_body_ids()
-        fed_bodies = np.unique(body[np.concatenate(inlet_cells_all)])
-        fill_region = np.isin(body, fed_bodies)
-        if not fill_region.all():
-            n_dry = int((~fill_region).sum())
-            n_bodies = len(np.setdiff1d(np.unique(body), fed_bodies))
-            warnings.warn(
-                f"{n_bodies} mesh body(ies) ({n_dry} cells) have no injection "
-                f"port and will stay dry; they are excluded from the fill "
-                f"criterion.", RuntimeWarning, stacklevel=2)
+        inlet_cells_all, cascade_events = self._apply_ports(celltype)
+        fill_region = self._fed_region(inlet_cells_all)
 
         # Per-element laminate scalars: each stack's value mapped to its cells.
         def per_element(fn):
@@ -2640,9 +3167,449 @@ class RTMSimulation:
         self._t_end = t
         return snapshots
 
+    def _apply_ports(self, celltype):
+        """Mark vent and inlet cells; returns (inlet cell arrays, cascade events)."""
+        inlet_cells_all = []
+        cascade_events = []
+        for port in self._ports:
+            if port.kind == "vent":
+                celltype[port.cells] = CELL_OUTLET
+            elif port.t_activate == 0.0:
+                celltype[port.cells] = CELL_INLET
+                inlet_cells_all.append(port.cells)
+            else:
+                cascade_events.append((port.t_activate, port.cells))
+                inlet_cells_all.append(port.cells)
+        if not (celltype == CELL_INLET).any():
+            raise RuntimeError("No inlet cells defined")
+        return inlet_cells_all, cascade_events
+
+    def _fed_region(self, inlet_cells_all):
+        """
+        Cells of the bodies with an injection port. Other bodies can never
+        fill: warn and leave them out of the fill criterion.
+        """
+        body = self._mesh.get_body_ids()
+        fed_bodies = np.unique(body[np.concatenate(inlet_cells_all)])
+        fill_region = np.isin(body, fed_bodies)
+        if not fill_region.all():
+            n_dry = int((~fill_region).sum())
+            n_bodies = len(np.setdiff1d(np.unique(body), fed_bodies))
+            warnings.warn(
+                f"{n_bodies} mesh body(ies) ({n_dry} cells) have no injection "
+                f"port and will stay dry; they are excluded from the fill "
+                f"criterion.", RuntimeWarning, stacklevel=4)
+        return fill_region
+
+    def _run_incompressible(self, on_snapshot):
+        """
+        Body of run() for i_model=4: incompressible resin, Darcy flow.
+
+        Each step solves div(h K/mu grad p) = 0 on the full cells, with
+        p_inlet on the boundary of the inlet ports, p_vent on the outlet
+        edges of full vent cells and, at the centres of the cells that are
+        not full, p_init (air ahead of the front) or the pressure of their
+        air pocket. The fill factor f of those cells then advances with the
+        Darcy inflow Q, phi V df/dt = Q, until the next cell is full (or
+        the fraction fill_fraction_per_step of the front cells).
+
+        Air cut off from every vent forms a pocket (open cells connected
+        through shared vertices) of isothermal ideal gas, p V = const. The
+        pocket pressure is an unknown of the pressure solve, linearised
+        over the step (backward Euler), so a pocket follows the resin
+        pressure around it. Pockets left when nothing else can fill and
+        their pressure balances the resin are reported as dry spots.
+        """
+        import scipy.sparse as sp
+        from scipy.sparse.csgraph import connected_components
+        st = self._settings
+        mesh = self._mesh
+        N = mesh.N
+        stacks, stack_id = self.get_laminate_map()
+        neighbours, celltype = create_faces(mesh, st.max_neighbours)
+        inlet_cells_all, cascade_events = self._apply_ports(celltype)
+        fill_region = self._fed_region(inlet_cells_all)
+
+        def per_element(fn):
+            return np.array([fn(s) for s in stacks], dtype=np.float64)[stack_id]
+
+        thickness = per_element(LaminateStack.get_total_thickness)
+        porosity = per_element(LaminateStack.get_effective_porosity)
+        viscosity = np.full(N, self._resin.get_viscosity())
+        k_used = max(int((neighbours >= 0).sum(axis=1).max()), 1)
+        nbrs = np.ascontiguousarray(neighbours[:, :k_used])
+        Kxx, Kxy, Kyy = build_stack_tensor(mesh, stacks, stack_id,
+                                           self._fibre_deviation)
+        fg = build_face_geometry(mesh, nbrs, thickness, Kxx, Kxy, Kyy,
+                                 viscosity)
+        ccx, ccy = fg.per_slot(fg.ox), fg.per_slot(fg.oy)
+        fi, fj, Tgeo = fg.fi, fg.fj, fg.T
+        phiV = porosity * thickness * mesh.get_cell_areas()
+
+        # Vents: p_vent acts on the mesh boundary edges of the vent cells
+        # (outlet faces); a vent port with no boundary edge is a hole, a
+        # reservoir at p_vent like an inlet port.
+        is_vent = celltype == CELL_OUTLET
+        oc, otau, osx, osy = build_outlet_edges(
+            mesh, np.nonzero(is_vent)[0], thickness, Kxx, Kxy, Kyy, viscosity)
+        tau_out = np.bincount(oc, weights=otau, minlength=N)
+        hole_ports = []
+        for port in self._ports:
+            cells = port.cells[is_vent[port.cells]] if port.kind == "vent" \
+                else np.empty(0, dtype=int)
+            if cells.size and not np.any(tau_out[cells] > 0.0):
+                hole_ports.append(cells)
+
+        p_in, p_out = float(self._p_inlet), float(self._p_init)
+        f_full = 1.0 - float(st.fill_tol)
+        g_fill = float(st.fill_time_threshold)
+        frac = float(st.fill_fraction_per_step)
+        correct = bool(st.flux_correction)
+        track_air = p_out > 0.0     # in vacuum (p_init = 0) pockets have p = 0
+
+        state = np.full(N, M4_OPEN, dtype=np.int64)
+        state[celltype == CELL_INLET] = M4_INLET
+        for cells in hole_ports:
+            state[cells] = M4_HOLE
+        f = np.where(state == M4_INLET, 1.0, 0.0)
+        p = np.where(state == M4_INLET, p_in, p_out)
+        air = np.where(state == M4_OPEN, p_out * phiV, 0.0)  # p V of the air
+        fill_time = np.full(N, np.nan)
+        fill_time[state == M4_INLET] = 0.0
+        # Resin stored in the preform: inlet ports at t = 0 and holes are
+        # reservoirs, not preform.
+        preform = state == M4_OPEN
+        hole_reached = [False] * len(hole_ports)
+        gx = np.zeros(N)
+        gy = np.zeros(N)
+
+        def lsq_weights():
+            return _m4_lsq_weights(nbrs, ccx, ccy, fg.slot_face, fg.slot_side,
+                                   fg.dx, fg.dy, state)
+        Wx, Wy = lsq_weights()
+
+        # Air moves between open cells that share a vertex: a cell wedged
+        # between two filled neighbours (e.g. where the front meets a wall)
+        # still vents through its corners.
+        inc = sp.csr_matrix((np.ones(3 * N), (np.repeat(np.arange(N), 3),
+                                              mesh.cellgridid.ravel())),
+                            shape=(N, mesh.nodes.shape[0]))
+        adj = (inc @ inc.T).tocoo()
+        upper = adj.row < adj.col
+        vi, vj = adj.row[upper], adj.col[upper]
+
+        # Pockets smaller than pocket_min_cells cells of air when they form
+        # are below mesh resolution (e.g. a cell cut off where the front
+        # meets a wall): their cells are left out of the air graph and
+        # fill as if vented.
+        untracked = np.zeros(N, dtype=bool)
+
+        def find_pockets(was_pocket):
+            """Open cells cut off from every vent, and their pocket index."""
+            open_ = (state == M4_OPEN) & ~untracked
+            node = open_ | (state == M4_HOLE)
+            e = node[vi] & node[vj]
+            graph = sp.coo_matrix((np.ones(int(e.sum())), (vi[e], vj[e])),
+                                  shape=(N, N))
+            _, label = connected_components(graph, directed=False)
+            vented_comp = np.zeros(label.max() + 1, dtype=bool)
+            vented_comp[label[(open_ & (tau_out > 0.0))
+                              | (state == M4_HOLE)]] = True
+            cells = np.nonzero(open_ & ~vented_comp[label])[0]
+            _, pid = np.unique(label[cells], return_inverse=True)
+            pid = pid.ravel().astype(np.int64)
+            n = int(pid.max()) + 1 if pid.size else 0
+            vol = np.bincount(pid, ((1.0 - f) * phiV)[cells], minlength=n)
+            cell_vol = (np.bincount(pid, phiV[cells], minlength=n)
+                        / np.maximum(np.bincount(pid, minlength=n), 1))
+            new = np.bincount(pid, was_pocket[cells], minlength=n) == 0
+            drop = new & (vol < st.pocket_min_cells * cell_vol)
+            if drop.any():
+                untracked[cells[drop[pid]]] = True
+                keep = ~drop[pid]
+                cells = cells[keep]
+                pid = (np.cumsum(~drop) - 1)[pid[keep]]
+            return cells, pid
+
+        n_pics = max(4, (self._n_pics // 4) * 4)
+        t_max = float(self._tmax)
+        dt_snap = t_max / n_pics
+        t_eps = 1e-9 * dt_snap
+
+        snapshots = self._snapshots
+
+        def take_snapshot(step, t):
+            snap = Snapshot(step=step, t=t, gamma=f.copy(), p=p.copy(),
+                            celltype=celltype.copy(), p_offset=0.0)
+            snapshots.append(snap)
+            if on_snapshot is not None:
+                on_snapshot(snap)
+
+        pending_cascade = sorted(
+            [(float(t_a), np.asarray(cids, dtype=int))
+             for t_a, cids in cascade_events], key=lambda e: e[0])
+
+        def step_length(Q, in_pocket, pk_Q, pk_vol):
+            """dt to the next fill event, snapshot, cascade or pocket limit,
+            and the number of front cells outside pockets gaining resin."""
+            dt = min(t_next - t, t_max - t)
+            if pending_cascade:
+                dt = min(dt, pending_cascade[0][0] - t)
+            active = (state == M4_OPEN) & (Q > 0.0)
+            n_act = int(active.sum())
+            if n_act:
+                tau_c = (1.0 - f[active]) * phiV[active] / Q[active]
+                m = max(1, int(frac * n_act))
+                dt = min(dt, float(np.partition(tau_c, m - 1)[m - 1]))
+            if pk_Q.size:
+                with np.errstate(divide="ignore"):
+                    lim = _POCKET_MAX_SHRINK * pk_vol / np.abs(pk_Q)
+                dt = min(dt, float(lim.min()))
+            return dt, int((active & ~in_pocket).sum())
+
+        injected = vented = spilled = 0.0
+        n_solves = 0
+        pk_cells = np.empty(0, dtype=np.int64)
+        pk_id = np.empty(0, dtype=np.int64)
+        n_pk = 0
+        topo_changed = True
+        complete = False
+        t = 0.0
+        t_next = dt_snap
+        dt = 1e-3 * dt_snap
+        step = 0
+        take_snapshot(0, 0.0)
+        while True:
+            while pending_cascade and pending_cascade[0][0] <= t + t_eps:
+                _, cids = pending_cascade.pop(0)
+                new = cids[state[cids] != M4_INLET]
+                injected += float(((1.0 - f[new]) * phiV[new]).sum())
+                state[new] = M4_INLET
+                celltype[new] = CELL_INLET
+                f[new] = 1.0
+                p[new] = p_in
+                air[new] = 0.0
+                fill_time[new] = np.where(np.isnan(fill_time[new]), t,
+                                          fill_time[new])
+                Wx, Wy = lsq_weights()
+                topo_changed = True
+            if np.all(f[fill_region] >= 1.0):
+                complete = True
+                break
+            if t >= t_max - t_eps:
+                break
+
+            # Air pockets: their current pressure p0 = (p V) / V.
+            p[state == M4_OPEN] = p_out
+            if track_air and topo_changed:
+                was_pocket = np.zeros(N, dtype=bool)
+                was_pocket[pk_cells] = True
+                pk_cells, pk_id = find_pockets(was_pocket)
+                n_pk = int(pk_id.max()) + 1 if pk_id.size else 0
+            topo_changed = False
+            in_pocket = np.zeros(N, dtype=bool)
+            in_pocket[pk_cells] = True
+            pk_air = np.bincount(pk_id, weights=air[pk_cells], minlength=n_pk)
+            pk_vol = np.bincount(pk_id, weights=((1.0 - f) * phiV)[pk_cells],
+                                 minlength=n_pk)
+            pk_p0 = pk_air / np.maximum(pk_vol, 1e-300)
+            p[pk_cells] = pk_p0[pk_id]
+
+            # Pressure solve: full cells plus one unknown per pocket, whose
+            # capacitance V / (p0 dt) needs dt; re-solved while the step
+            # length found differs from the guess by more than 2x.
+            unk = np.nonzero(state == M4_FULL)[0]
+            n_full = unk.size
+            n_unk = n_full + n_pk
+            uid = np.full(N, -1, dtype=np.int64)
+            uid[unk] = np.arange(n_full)
+            uid[pk_cells] = n_full + pk_id
+            method = st.linear_solver
+            if method == "auto":
+                method = ("direct" if n_unk <= st.direct_max_cells
+                          else "iterative")
+            dt_guess = dt
+            for _ in range(3 if n_pk else 1):
+                cap = pk_vol / (pk_p0 * dt_guess)
+                if n_unk:
+                    rows, cols, vals, rhs = _m4_assemble(
+                        fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau,
+                        osx, osy, nbrs, Wx, Wy, state, uid, p, n_unk, p_out,
+                        correct)
+                    if n_pk:
+                        k_pk = n_full + np.arange(n_pk)
+                        rows = np.concatenate([rows, k_pk])
+                        cols = np.concatenate([cols, k_pk])
+                        vals = np.concatenate([vals, cap])
+                        rhs[n_full:] += cap * pk_p0
+                    x0 = np.concatenate([p[unk], pk_p0])
+                    x = _m4_linear_solve(rows, cols, vals, rhs, n_unk, x0,
+                                         method, st.iterative_rtol)
+                    if not np.all(np.isfinite(x)):
+                        raise FloatingPointError(
+                            f"i_model=4: pressure solve failed at t={t:.4g} s "
+                            f"(step {step}, {n_full} full cells, {n_pk} air "
+                            f"pockets)")
+                    n_solves += 1
+                    p[unk] = x[:n_full]
+                    p[pk_cells] = x[n_full + pk_id]
+                _m4_gradient(nbrs, Wx, Wy, p, state, gx, gy)
+                Tf, gf, To, go = _m4_face_terms(
+                    fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau, osx,
+                    osy, state, gx, gy, correct)
+                Q, q_out = _m4_net_inflow(fi, fj, Tf, gf, oc, To, go, p,
+                                          p_out, N)
+                pk_Q = np.bincount(pk_id, weights=Q[pk_cells], minlength=n_pk)
+                dt, n_act = step_length(Q, in_pocket, pk_Q, pk_vol)
+                if not n_pk or 0.5 <= dt / dt_guess <= 2.0:
+                    break
+                dt_guess = dt
+
+            # Done when nothing outside the pockets can still fill and every
+            # pocket balances the resin pressure around it (dry spots).
+            # The resin around a pocket imposes P_eq = sum T p / G (G = sum
+            # T over its faces); from the solved C (P - p0) = G (P_eq - P),
+            # P_eq - p0 = (C + G) / G (P - p0).
+            if not n_act and not pending_cascade:
+                settled = np.ones(n_pk, dtype=bool)
+                if n_pk:
+                    pid = np.full(N, -1, dtype=np.int64)
+                    pid[pk_cells] = pk_id
+                    a, b = pid[fi], pid[fj]
+                    pk_G = (np.bincount(a[a >= 0], Tf[a >= 0], minlength=n_pk)
+                            + np.bincount(b[b >= 0], Tf[b >= 0],
+                                          minlength=n_pk))
+                    gap = (np.abs(x[n_full:] - pk_p0) * (cap + pk_G)
+                           / np.maximum(pk_G, 1e-300))
+                    settled = ((pk_G <= 0.0)
+                               | (gap <= st.pocket_tol * (p_in - p_out)))
+                if settled.all():
+                    break
+
+            # Advance the fill factors; cells reaching f = 1 pass any
+            # excess on to their dry neighbours.
+            open_ = state == M4_OPEN
+            f_old = f.copy()
+            rate = np.where(open_, Q / phiV, 0.0)
+            f[open_] += rate[open_] * dt
+            if n_pk and np.any(f[pk_cells] < 0.0):
+                # The uniform pocket pressure lets resin through a pocket
+                # (in on its high-pressure side, out on the low one): cells
+                # without resin to lose take it from the rest of the pocket.
+                vol = f[pk_cells] * phiV[pk_cells]
+                neg = vol < 0.0
+                deficit = np.bincount(pk_id[neg], weights=-vol[neg],
+                                      minlength=n_pk)
+                have = np.bincount(pk_id[~neg], weights=vol[~neg],
+                                   minlength=n_pk)
+                keep = np.clip(1.0 - deficit / np.maximum(have, 1e-300),
+                               0.0, 1.0)
+                f[pk_cells] = np.where(neg, 0.0, f[pk_cells] * keep[pk_id])
+            np.maximum(f, 0.0, out=f)
+            cross = (open_ & (f_old < g_fill) & (f >= g_fill)
+                     & np.isnan(fill_time))
+            fill_time[cross] = t + (g_fill - f_old[cross]) / rate[cross]
+            injected -= float(Q[state == M4_INLET].sum()) * dt
+            vented += (q_out + float(Q[state == M4_HOLE].sum())) * dt
+            for k, cells in enumerate(hole_ports):
+                if not hole_reached[k] and Q[cells].sum() > 0.0:
+                    hole_reached[k] = True      # shown as filled from now on
+                    f[cells] = 1.0
+            newly = open_ & (f >= f_full)
+            if newly.any():
+                excess = np.zeros(N)
+                excess[newly] = np.maximum((f[newly] - 1.0) * phiV[newly], 0.0)
+                f[newly] = 1.0
+                state[newly] = M4_FULL
+                # Overflow never enters an air pocket: resin gets in there
+                # only by compressing the air (implicit pocket pressure).
+                take = (state == M4_OPEN) & ~in_pocket
+                v_out, s_out = _m4_spill(excess, f, phiV, take, state,
+                                         tau_out, nbrs, fg.slot_face, Tgeo, Q,
+                                         f_full)
+                vented += v_out
+                spilled += s_out
+                topo_changed = True
+            late = (f >= g_fill) & np.isnan(fill_time)
+            fill_time[late] = t + dt
+            if track_air:
+                # Open cells outside pockets hold air at p_init; a pocket
+                # keeps its p V while its air volume changes.
+                air_vol = (1.0 - f) * phiV
+                air = np.where(state == M4_OPEN, p_out * air_vol, 0.0)
+                if n_pk:
+                    vol_new = np.bincount(pk_id, weights=air_vol[pk_cells],
+                                          minlength=n_pk)
+                    p_new = pk_air / np.maximum(vol_new, 1e-300)
+                    air[pk_cells] = p_new[pk_id] * air_vol[pk_cells]
+                    p[pk_cells] = p_new[pk_id]
+            t += dt
+            step += 1
+            if t >= t_next - t_eps:
+                take_snapshot(step, t)
+                t_next += dt_snap
+
+        dry_spots = []
+        if track_air and not complete:
+            was_pocket = np.ones(N, dtype=bool)     # no new untracked pockets
+            pk_cells, pk_id = find_pockets(was_pocket)
+            for k in range(int(pk_id.max()) + 1 if pk_id.size else 0):
+                cells = pk_cells[pk_id == k]
+                v_air = float(((1.0 - f) * phiV)[cells].sum())
+                pv = float(air[cells].sum())
+                dry_spots.append(dict(
+                    cells=cells, pressure=pv / max(v_air, 1e-300),
+                    air_volume=v_air, air_volume_at_p_init=pv / p_out))
+        if snapshots[-1].step != step:
+            take_snapshot(step, t)
+        self._fill_time = fill_time
+        self._fill_region = fill_region
+        self._fill_complete = complete
+        self._t_end = t
+        self._m4_info = dict(
+            n_steps=step, n_solves=n_solves, injected=injected,
+            stored=float((f * phiV)[preform].sum()), vented=vented,
+            spilled=spilled, dry_spots=dry_spots)
+        return snapshots
+
     # ------------------------------------------------------------------
     # Result getters
     # ------------------------------------------------------------------
+    def _require_m4(self):
+        self._require_results()
+        if self._m4_info is None:
+            raise RuntimeError("only tracked by the incompressible model "
+                               "(i_model=4)")
+        return self._m4_info
+
+    def get_volume_balance(self):
+        """
+        i_model=4: resin volumes [m^3] injected, stored in the preform,
+        vented and spilled (resin with no dry cell left to go to), plus
+        error = injected - stored - vented - spilled and its relative value.
+        """
+        info = self._require_m4()
+        b = {k: float(info[k])
+             for k in ("injected", "stored", "vented", "spilled")}
+        b["error"] = b["injected"] - b["stored"] - b["vented"] - b["spilled"]
+        b["relative_error"] = abs(b["error"]) / max(b["injected"], 1e-300)
+        return b
+
+    def get_dry_spots(self):
+        """
+        i_model=4: air pockets left at the end of the run (dry spots), one
+        dict each: cells, pressure [Pa], air_volume [m^3] and
+        air_volume_at_p_init [m^3] (the same air at p_init). Empty when the
+        fill completed.
+        """
+        return [dict(d, cells=d["cells"].copy())
+                for d in self._require_m4()["dry_spots"]]
+
+    def get_run_stats(self):
+        """i_model=4: number of time steps and pressure solves."""
+        info = self._require_m4()
+        return dict(n_steps=info["n_steps"], n_solves=info["n_solves"])
+
     def _require_results(self):
         if not self._snapshots:
             raise RuntimeError("No results: call run() first")

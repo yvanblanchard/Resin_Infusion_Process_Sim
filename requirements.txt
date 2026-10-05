@@ -1,6 +1,7 @@
 numpy
 matplotlib
 numba
+scipy
 trimesh
 rtree
 pyvista

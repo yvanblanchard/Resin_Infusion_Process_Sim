@@ -51,7 +51,10 @@ Outputs (output_validation_double_dome/<geometry>/)
   summary.csv                  front positions, errors and front speeds
 
 Run:  python validation_double_dome.py [--geometry stl|parametric]
-      [--skip-verification] [--spacing 10] [--model 2]
+      [--skip-verification] [--spacing 10] [--model 1|2|4]
+      --model 4 (incompressible resin) adds a third variant, shear-dependent
+      K with the K1 angle measured from the warp instead of the weft, and a
+      run of every variant to the end of fill; outputs go to <geometry>_model4
 """
 import argparse
 import csv
@@ -370,9 +373,15 @@ def porosity_of_shear(g_deg):
     return 1.0 - (1.0 - PHI_0) / np.cos(np.radians(g_deg))
 
 
-def k1_direction(drape):
-    """Unit K1 vectors: weft rotated by Eq. (11) towards the acute bisector."""
+def k1_direction(drape, k1_on="weft"):
+    """
+    Unit K1 vectors: weft rotated by Eq. (11) towards the acute bisector.
+    The paper does not say which yarn of the 0/90 ply is the weft;
+    k1_on="warp" starts from the other yarn instead.
+    """
     w1, w2 = drape["weft"], drape["warp"]
+    if k1_on == "warp":
+        w1, w2 = w2, w1
     flip = np.where(np.einsum("ij,ij->i", w1, w2) >= 0.0, 1.0, -1.0)
     b = w1 + flip[:, None] * w2
     t = b - np.einsum("ij,ij->i", b, w1)[:, None] * w1
@@ -388,7 +397,14 @@ def k1_direction(drape):
 AIR_EOS = dict(p_ref=1.01325e5, rho_ref=1.225, gamma=1.4)
 
 
-def build_sim(mesh, drape, mu, tmax, model, shear_dependent):
+VARIANTS = {   # name: (shear-dependent K, yarn the K1 angle starts from)
+    "iso": (False, None),
+    "shear": (True, "weft"),
+    "shear_warp": (True, "warp"),
+}
+
+
+def build_sim(mesh, drape, mu, tmax, model, shear_dependent, k1_on="weft"):
     resin = (rtm.ResinMaterial("olive oil").set_viscosity(mu)
              .set_density(RHO_OIL))
     t_ply = THICKNESS
@@ -408,7 +424,7 @@ def build_sim(mesh, drape, mu, tmax, model, shear_dependent):
         # principal direction of Eq. (11). Eqs. (9)-(10) were characterised
         # for 0-40 deg; the fishnet locks harder than that at the far end of
         # the ridge (no draw-in), so the shear is clamped to 40 deg there.
-        e1 = k1_direction(drape)
+        e1 = k1_direction(drape, k1_on)
         g_bin = np.round(np.minimum(np.abs(drape["shear"]), SHEAR_MAX)
                          ).astype(int)
         for k, gb in enumerate(np.unique(g_bin)):
@@ -425,6 +441,25 @@ def build_sim(mesh, drape, mu, tmax, model, shear_dependent):
     ymat = drape["mat"][drape["tris"]].mean(axis=1)[:, 1]
     sim.add_vent_cells(np.where(ymat > PLY_HALF[1] - drape["spacing"])[0])
     return sim
+
+
+def full_fill(mesh, drape, case):
+    """i_model=4: run each variant on to the end of fill (ply edges, vents)."""
+    for variant, (shear_dep, k1_on) in VARIANTS.items():
+        sim = build_sim(mesh, drape, case["mu"], 20.0 * case["tmax"], 4,
+                        shear_dep, k1_on)
+        sim.run()
+        g = sim.get_final_snapshot().gamma
+        vents = np.concatenate([p.cells for p in sim.get_ports()
+                                if p.kind == "vent"])
+        spots = sim.get_dry_spots()
+        print(f"    full fill, {variant}: "
+              f"{'complete' if sim.is_fill_complete() else 'NOT complete'} "
+              f"at {sim.get_total_fill_time():.0f} s; cells not full "
+              f"{int((g < 1).sum())} of {g.size} (vents {int((g[vents] < 1).sum())}"
+              f" of {vents.size}); {len(spots)} dry spot(s)"
+              + (f", air {sum(d['air_volume'] for d in spots):.2e} m^3"
+                 if spots else ""))
 
 
 def run_sim(sim, label):
@@ -599,6 +634,7 @@ GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
 BLUE = "#2a78d6"     # shear-dependent model (ours solid, paper dashed)
 ORANGE = "#eb6834"   # isotropic model (ours solid, paper dashed)
+AQUA = "#1baf7a"     # shear-dependent model, K1 angle from the warp (ours)
 SURFACE = "#fcfcfb"
 
 plt.rcParams.update({
@@ -684,9 +720,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--spacing", type=float, default=10.0,
                     help="drape net / mesh spacing [mm] (default 10)")
-    ap.add_argument("--model", type=int, default=2, choices=(1, 2),
+    ap.add_argument("--model", type=int, default=2, choices=(1, 2, 4),
                     help="process model (default 2: constant porosity; "
-                         "model 1 ignores porosity)")
+                         "model 1 ignores porosity; model 4: incompressible "
+                         "resin, also runs K1 on the warp and a full fill)")
     ap.add_argument("--geometry", choices=("stl", "parametric"),
                     default="stl",
                     help="tool surface: benchmark STL x2 (default) or the "
@@ -697,8 +734,10 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "output_validation_double_dome", args.geometry)
+                          "output_validation_double_dome", args.geometry
+                          + ("" if args.model == 2 else f"_model{args.model}"))
     os.makedirs(outdir, exist_ok=True)
+    variants = ["iso", "shear"] + (["shear_warp"] if args.model == 4 else [])
 
     if not args.skip_verification:
         verification(outdir, args.spacing, args.model)
@@ -720,11 +759,14 @@ def main():
         print(f"    mesh {mesh.N} triangles; shear {g.min():.1f} .. "
               f"{g.max():.1f} deg")
         fts = {}
-        for variant, shear_dep in (("iso", False), ("shear", True)):
+        for variant in variants:
+            shear_dep, k1_on = VARIANTS[variant]
             sim = build_sim(mesh, dr, case["mu"], case["tmax"], args.model,
-                            shear_dep)
+                            shear_dep, k1_on)
             fts[variant] = run_sim(sim, variant)
         results[key] = dict(drape=dr, ft=fts, case=case)
+        if args.model == 4:
+            full_fill(mesh, dr, case)
 
     rows = postprocess(results, outdir)
     write_csv(rows, os.path.join(outdir, "summary.csv"))
@@ -785,6 +827,8 @@ def postprocess(results, outdir):
                 ax.plot(s[:, 0], s[:, 1], color=ORANGE, lw=2.0)
             for s in segs["shear"]:
                 ax.plot(s[:, 0], s[:, 1], color=BLUE, lw=2.0)
+            for s in segs.get("shear_warp", []):
+                ax.plot(s[:, 0], s[:, 1], color=AQUA, lw=2.0)
             for name, color in (("basic", ORANGE), ("model", BLUE)):
                 c = np.array(paper[name][t], float)
                 ax.plot(c[:, 0], c[:, 1], color=color, lw=1.2, ls=(0, (4, 2)))
@@ -798,9 +842,9 @@ def postprocess(results, outdir):
             # Errors: radial distance to the experimental front.
             r_exp = polar_profile([np.array(paper["exp"][t], float)], theta)
             mae = {}
+            ours = [(f"ours_{v}", polar_profile(segs[v], theta)) for v in segs]
             for name, prof in (
-                    ("ours_shear", polar_profile(segs["shear"], theta)),
-                    ("ours_iso", polar_profile(segs["iso"], theta)),
+                    *ours,
                     ("paper_model", polar_profile([np.array(paper["model"][t], float)], theta)),
                     ("paper_basic", polar_profile([np.array(paper["basic"][t], float)], theta))):
                 mae[name] = float(np.nanmean(np.abs(prof - r_exp)))
@@ -810,7 +854,7 @@ def postprocess(results, outdir):
 
             ey, ex = curve_axis_values(paper["exp"][t])
             row = dict(case=key, t=t, exp_y=ey, exp_x=ex)
-            for v in ("shear", "iso"):
+            for v in fnode:
                 row[f"{v}_y"] = float(axis_front(plan, y_line, fnode[v], 1, [t])[0])
                 row[f"{v}_x"] = float(axis_front(plan, x_line, fnode[v], 0, [t])[0])
             for name in ("model", "basic"):
@@ -825,13 +869,18 @@ def postprocess(results, outdir):
                        label="RTMsim-Py, shear-dependent K"),
             plt.Line2D([], [], color=BLUE, lw=1.2, ls=(0, (4, 2)),
                        label="paper (Fluent), shear-dependent K"),
+            *([plt.Line2D([], [], color=AQUA, lw=2.0,
+                          label="RTMsim-Py, K(γ), K1 from the warp")]
+              if "shear_warp" in fnode else []),
             plt.Line2D([], [], color=ORANGE, lw=2.0,
                        label="RTMsim-Py, isotropic K"),
             plt.Line2D([], [], color=ORANGE, lw=1.2, ls=(0, (4, 2)),
                        label="paper (Fluent), isotropic K"),
             plt.Line2D([], [], color=AXIS, lw=1.0, label="paper's ply outline"),
         ]
-        fig_f.legend(handles=handles, loc="lower center", ncol=6, fontsize=8)
+        fig_f.legend(handles=handles, loc="lower center",
+                     ncol=(len(handles) + 1) // 2 if len(handles) > 6 else 6,
+                     fontsize=8)
         fig_f.suptitle(f"Flow fronts, {case['label']} sample (plan view, "
                        f"quarter model)", x=0.01, ha="left", fontsize=10)
         fig_f.tight_layout(rect=(0, 0.06, 1, 0.95))
@@ -843,7 +892,10 @@ def postprocess(results, outdir):
         for a_idx, (line, coord, name) in enumerate(
                 ((y_line, 1, "long axis (y)"), (x_line, 0, "short axis (x)"))):
             ax = axes_t[c_idx, a_idx]
-            for v, color in (("iso", ORANGE), ("shear", BLUE)):
+            for v, color in (("iso", ORANGE), ("shear", BLUE),
+                             ("shear_warp", AQUA)):
+                if v not in fnode:
+                    continue
                 ax.plot(tt, axis_front(plan, line, fnode[v], coord, tt),
                         color=color, lw=2.0)
             ax_key = "y" if coord == 1 else "x"
@@ -873,6 +925,9 @@ def postprocess(results, outdir):
         plt.Line2D([], [], color=BLUE, lw=2.0, label="RTMsim-Py, shear-dependent K"),
         plt.Line2D([], [], color=BLUE, marker="s", mfc=SURFACE, ls="none",
                    label="paper (Fluent), shear-dependent K"),
+        *([plt.Line2D([], [], color=AQUA, lw=2.0,
+                      label="RTMsim-Py, K(γ), K1 from the warp")]
+          if any("shear_warp" in r["ft"] for r in results.values()) else []),
         plt.Line2D([], [], color=ORANGE, lw=2.0, label="RTMsim-Py, isotropic K"),
         plt.Line2D([], [], color=ORANGE, marker="D", mfc=SURFACE, ls="none",
                    label="paper (Fluent), isotropic K"),
@@ -897,25 +952,38 @@ def postprocess(results, outdir):
 
 
 def print_summary(rows, results):
+    warp = "shear_warp_y" in rows[0]
     print("\n[3] Front positions on the symmetry axes [mm] (plan view)")
     hdr = (f"  {'case':5s} {'t[s]':>5s} | {'exp':>5s} {'ours K(γ)':>9s} "
-           f"{'ours iso':>8s} {'Fluent K(γ)':>11s} {'Fluent iso':>10s}")
+           + (f"{'K1 warp':>8s} " if warp else "")
+           + f"{'ours iso':>8s} {'Fluent K(γ)':>11s} {'Fluent iso':>10s}")
     for axis in ("y", "x"):
         print(f"  -- front on the {'long (y)' if axis == 'y' else 'short (x)'} axis")
         print(hdr)
         for r in rows:
             f = lambda v: "   edge" if not np.isfinite(v) else f"{v:7.0f}"
             print(f"  {r['case']:5s} {r['t']:5d} | {f(r['exp_'+axis]):>5s} "
-                  f"{f(r['shear_'+axis]):>9s} {f(r['iso_'+axis]):>8s} "
+                  f"{f(r['shear_'+axis]):>9s} "
+                  + (f"{f(r['shear_warp_'+axis]):>8s} " if warp else "")
+                  + f"{f(r['iso_'+axis]):>8s} "
                   f"{f(r['paper_model_'+axis]):>11s} "
                   f"{f(r['paper_basic_'+axis]):>10s}")
     print("\n  Mean radial distance to the experimental front [mm]")
-    print(f"  {'case':5s} {'t[s]':>5s} | {'ours K(γ)':>9s} {'ours iso':>8s} "
+    print(f"  {'case':5s} {'t[s]':>5s} | {'ours K(γ)':>9s} "
+          + (f"{'K1 warp':>8s} " if warp else "")
+          + f"{'ours iso':>8s} "
           f"{'Fluent K(γ)':>11s} {'Fluent iso':>10s} | ours iso vs Fluent iso")
     for r in rows:
         print(f"  {r['case']:5s} {r['t']:5d} | {r['mae_ours_shear']:9.1f} "
-              f"{r['mae_ours_iso']:8.1f} {r['mae_paper_model']:11.1f} "
+              + (f"{r['mae_ours_shear_warp']:8.1f} " if warp else "")
+              + f"{r['mae_ours_iso']:8.1f} {r['mae_paper_model']:11.1f} "
               f"{r['mae_paper_basic']:10.1f} | {r['mae_iso_vs_paper_basic']:8.1f}")
+    print("  Mean over the measured times: "
+          + ", ".join(f"{name} {np.mean([r['mae_' + name] for r in rows]):.1f}"
+                      for name in (["ours_shear"]
+                                   + (["ours_shear_warp"] if warp else [])
+                                   + ["ours_iso", "paper_model",
+                                      "paper_basic"])))
 
     print("\n  Mean front speed on the long axis between measured times [mm/s]")
     for key in results:
@@ -924,7 +992,9 @@ def print_summary(rows, results):
             dt = b["t"] - a["t"]
             sp = lambda k: (b[k] - a[k]) / dt
             print(f"  {key:5s} {a['t']:5d}-{b['t']:<5d} exp {sp('exp_y'):6.3f}  "
-                  f"ours K(γ) {sp('shear_y'):6.3f}  ours iso {sp('iso_y'):6.3f}  "
+                  f"ours K(γ) {sp('shear_y'):6.3f}  "
+                  + (f"K1 warp {sp('shear_warp_y'):6.3f}  " if warp else "")
+                  + f"ours iso {sp('iso_y'):6.3f}  "
                   f"Fluent K(γ) {sp('paper_model_y'):6.3f}")
 
 

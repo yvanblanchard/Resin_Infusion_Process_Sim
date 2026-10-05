@@ -17,6 +17,30 @@ Python port of [RTMsim](https://github.com/obertscheiderfhwn/RTMsim) (Christof O
 - **Flux:** first-order upwind, central ρ on face, upwinded velocity/γ.
 - **Momentum update:** explicit pressure + convection, **implicit** Darcy drag with a full 2×2 inverse `−μ K⁻¹ u`.
 - **Anisotropy:** per-element 2×2 in-plane permeability tensor `K` derived from the laminate stack (see below). The solver consumes `(Kxx, Kxy, Kyy)` directly — no diagonal-axis assumption.
+
+The above describes process models 1–3 (`set_process_model(1|2|3)`). In models 2/3 the fill state follows from the density through the EOS, so the cells next to a vent, held near the vent pressure, never count as filled.
+
+### Incompressible model (`set_process_model(4)`)
+
+- **Resin:** incompressible, Darcy flow, isothermal, rigid preform; no air EOS needed.
+- **Pressure:** each step solves `∇·(h K/μ ∇p) = 0` on the full cells, with
+  `p_inlet` on the boundary of the inlet ports, `p_vent` (= `p_init`) on the outer
+  (mesh boundary) edges of full vent cells, and `p_init` or the air-pocket
+  pressure in the cells not yet full. A vent with no boundary edge is a hole held at `p_vent`.
+- **Fill factor:** `φ V df/dt = Q_in` in the cells not yet full; a step ends when the
+  next front cells are full (`fill_fraction_per_step`). The fill state never depends on
+  pressure: vent cells fill like the rest, and the run completes when every cell is full.
+- **Fluxes:** finite volumes on the shell, each half-face in its own cell's plane
+  (curved shells, harmonic K across faces). The flux is two-point plus an implicit
+  least-squares correction for skewed cells and anisotropic K; front faces are
+  two-point (the face is the front), so resin never leaves a front cell.
+- **Trapped air:** dry regions cut off from every vent are isothermal ideal gas
+  (`p V = const`), solved implicitly with the pressure; pockets left in balance with the
+  resin are reported by `get_dry_spots()`.
+- **Results:** same getters as the other models, plus `get_volume_balance()`,
+  `get_dry_spots()` and `get_run_stats()`. Verified against exact solutions in
+  `validation/verification_model4.py` (1-D and radial fronts, anisotropic ellipse, curved
+  vs flat shell, volume balance, full fill, trapped air).
 `
 
 Example:
@@ -26,11 +50,15 @@ Example:
 ## Install and run
 
 ```bash
-pip install numpy matplotlib numba trimesh rtree
+pip install numpy matplotlib numba scipy trimesh rtree   # scipy: i_model 4
 python demo_4ply.py        # RTM filling, 4-ply stack
 python demo_lcm.py         # VARI (LCM) process
 python demo_thermal.py     # thermal and cure
 python mesh_annulusfiller.py
+python validation_double_dome.py   # vs. double dome infusion experiments (validation/)
+python view_double_dome.py         # 3-D PyVista view of that case (time slider)
+python validation_double_dome.py --model 4   # same with the incompressible model
+python verification_model4.py      # i_model 4 vs exact solutions (validation/)
 
 pip install pyvista mmgpy  # needed by the STL test only
 python test_filling_frame.py   # STL shell, mmgs remesh, cascade ports, PyVista view
