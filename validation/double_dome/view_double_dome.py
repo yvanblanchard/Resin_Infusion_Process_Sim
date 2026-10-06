@@ -136,9 +136,9 @@ class Case:
         self.drape = dr = vdd.drape_ply(self.case["fibre_deg"], spacing)
         mesh = rtm.ShellMesh.from_arrays(dr["xyz"], dr["tris"], scale=1e-3,
                                          units="mm")
-        shear_dep, k1_on = vdd.VARIANTS[variant]
+        shear_dep, k1_on, k_scale = vdd.VARIANTS[variant]
         sim = vdd.build_sim(mesh, dr, self.case["mu"], self.tmax, model,
-                            shear_dep, k1_on)
+                            shear_dep, k1_on, k_scale)
         print(f"Running {self.case['label']}, {variant} K, i_model={model}, "
               f"{mesh.N} cells (quarter)...")
         self.fill_time_q = vdd.run_sim(sim, variant)
@@ -259,7 +259,9 @@ def build_plotter(cs, t0, off_screen, geom_label):
     tool = tool_surface()
     inlet, vent = cs.port_meshes()
     k_label = {"iso": "isotropic K", "shear": "shear-dependent K",
-               "shear_warp": "shear-dependent K, K1 from the warp"}
+               "shear_warp": "shear-dependent K, K1 from the warp",
+               "shear_fit": f"shear-dependent K × ({vdd.K_FIT[0]:g}, "
+                            f"{vdd.K_FIT[1]:g}), fit to Fluent"}
     title = (f"Double dome, {cs.case['label']} sample, "
              f"{k_label[cs.variant]}, i_model={cs.model}, {geom_label}")
 

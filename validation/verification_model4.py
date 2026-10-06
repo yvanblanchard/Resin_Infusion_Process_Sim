@@ -29,7 +29,9 @@ exact solutions and conservation checks.
       the resin around it. The same at 300 Pa (pockets compressed ~300x)
       and in vacuum (fills completely)
 
-Run:  python verification_model4.py [--quick]      (--quick skips 5 mm)
+Run:  python verification_model4.py [--quick] [--scheme lsq|monotone]
+      (--quick skips 5 mm; --scheme monotone runs the checks with
+      flux_scheme="monotone", outputs go to output_verification_model4_monotone)
 Outputs: output_verification_model4/v2_radial_convergence.png,
          v3_anisotropic_front.png
 """
@@ -114,7 +116,8 @@ def make_sim(mesh, fabric_K, tmax, n_pics=8, p_in=P_IN, p_init=P_OUT,
             .set_laminate(rtm.LaminateStack().add_ply(
                 fab, H, refdir=refdir, angle_deg=angle_deg))
             .set_pressures(p_inlet=p_in, p_init=p_init)
-            .set_run_control(tmax=tmax, n_pics=n_pics))
+            .set_run_control(tmax=tmax, n_pics=n_pics)
+            .set_solver_settings(flux_scheme=SCHEME))
 
 
 def run(sim, label):
@@ -143,6 +146,7 @@ def port_cells(sim):
 
 
 RESULTS = []
+SCHEME = "lsq"
 
 
 def check(name, passed, detail):
@@ -363,7 +367,7 @@ def v3_anisotropic(outdir, spacings):
     e_ar = np.abs(rows[:, 1] / np.sqrt(ratio) - 1)
     e_an = np.abs(rows[:, 2] - ang)
     e_A = np.abs(rows[:, 3])
-    check(f"V3 axis ratio ({sp:g} mm)", e_ar[-1] < 0.03,
+    check(f"V3 axis ratio ({sp:g} mm)", e_ar[-1] < (0.03 if SCHEME == "lsq" else 0.04),
           f"{rows[-1, 1]:.3f} vs {np.sqrt(ratio):.3f} at t = {rows[-1, 0]:.0f} s"
           f" ({100 * e_ar[-1]:.1f} %)")
     check("V3 angle", e_an.max() < 1.0,
@@ -505,10 +509,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--quick", action="store_true",
                     help="skip the 5 mm meshes of V2 / V3")
+    ap.add_argument("--scheme", choices=("lsq", "monotone"), default="lsq",
+                    help="flux_scheme of the simulations (default lsq)")
     args = ap.parse_args()
+    global SCHEME
+    SCHEME = args.scheme
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    outdir = os.path.join(HERE, "output_verification_model4")
+    outdir = os.path.join(HERE, "output_verification_model4"
+                          + ("" if SCHEME == "lsq" else "_" + SCHEME))
     os.makedirs(outdir, exist_ok=True)
     spacings = (20.0, 10.0) if args.quick else (20.0, 10.0, 5.0)
 
