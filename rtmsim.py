@@ -25,13 +25,19 @@ meshes. Four process models are supported:
                phi V df/dt = Q. f does not depend on pressure, so the
                cells next to the vents fill. Air cut off from the vents is
                an isothermal ideal gas (p V = const) and can end as a dry
-               spot. Needs scipy; no air EOS.
+               spot. Needs scipy; no air EOS. flux_scheme="monotone" (solver
+               settings) swaps the flux for a nonlinear two-point flux with
+               positive coefficients that obeys the maximum principle for
+               strongly anisotropic K (slower).
 
 Object model
 ------------
     ResinMaterial    resin flow / thermal / cure properties
     FabricMaterial   dry reinforcement: permeability, porosity,
                      compaction law, fibre thermal properties
+    UDMaterial       FabricMaterial for unidirectional fabric / slit tape,
+                     with K1, K2, porosity from the fibre volume fraction
+                     (Gebart) or from a tape layup with gaps
     LaminateStack    ordered plies (fabric + thickness + fibre direction,
                      global or per element); one default stack plus
                      optional per-region stacks (PCOMP-style)
@@ -348,6 +354,143 @@ class FabricMaterial:
         _missing(repr(self), missing)
 
 
+def _duct_permeability(a, b):
+    """
+    Permeability [m^2] of a straight rectangular duct a x b [m] as a
+    Darcy medium (K = mean velocity mu / (-dp/dx)): the exact series
+    solution, a^2/12 for a slot (b >> a), 0.0351 a^2 for a square duct.
+    """
+    a, b = min(a, b), max(a, b)
+    n = np.arange(1, 200, 2)
+    s = np.sum(np.tanh(n * np.pi * b / (2.0 * a)) / n ** 5)
+    return a * a / 12.0 * (1.0 - 192.0 * a / (np.pi ** 5 * b) * s)
+
+
+# Gebart (1992): parallel flow constant c, perpendicular constant C1 and
+# maximum fibre volume fraction of a quadratic / hexagonal fibre packing.
+_GEBART = {
+    "quad": (57.0, 16.0 / (9.0 * np.pi * np.sqrt(2.0)), np.pi / 4.0),
+    "hex": (53.0, 16.0 / (9.0 * np.pi * np.sqrt(6.0)),
+            np.pi / (2.0 * np.sqrt(3.0))),
+}
+
+
+class UDMaterial(FabricMaterial):
+    """
+    Unidirectional reinforcement (UD fabric, slit tape). A FabricMaterial
+    whose K1 [m^2] is the permeability along the fibres and K2 across
+    them, with two constructors that compute K1, K2 and the porosity from
+    what is known about the material instead of requiring them as input:
+
+      from_fibre_volume_fraction  a fibre bed (Gebart's model)
+      from_tape_layup             tapes laid with gaps between them
+
+    Everything else (set_permeability, set_porosity, set_compaction,
+    set_thermal_properties) is inherited and can overwrite the computed
+    values, e.g. with measured ones. A UDMaterial goes into
+    LaminateStack.add_ply like any FabricMaterial; the ply's `refdir` is
+    the fibre / tape direction.
+
+    Both models give an in-plane permeability of the ply only. The flow is
+    still averaged through the thickness of the stack (see LaminateStack):
+    gap channels enter through the element tensor, not as a separate path.
+    """
+
+    def __init__(self, name="UD"):
+        super().__init__(name)
+        self._model = None
+
+    def __repr__(self):
+        return f"UDMaterial({self._name!r})"
+
+    def get_model_inputs(self):
+        """Inputs of the constructor that built this material, or None."""
+        return None if self._model is None else dict(self._model)
+
+    @staticmethod
+    def _fibre_bed(Vf, fibre_radius, packing):
+        """Gebart's (K parallel, K perpendicular) [m^2] of a fibre bed."""
+        if packing not in _GEBART:
+            raise ValueError("packing must be 'quad' or 'hex'")
+        Vf = _positive(Vf, "fibre volume fraction")
+        R = _positive(fibre_radius, "fibre_radius")
+        c, C1, Vmax = _GEBART[packing]
+        if Vf >= Vmax:
+            raise ValueError(f"fibre volume fraction {Vf:g} must be below the "
+                             f"{packing} packing limit {Vmax:.3f}")
+        k_par = 8.0 * R * R / c * (1.0 - Vf) ** 3 / Vf ** 2
+        k_perp = C1 * (np.sqrt(Vmax / Vf) - 1.0) ** 2.5 * R * R
+        return float(k_par), float(k_perp)
+
+    @classmethod
+    def from_fibre_volume_fraction(cls, Vf, fibre_radius, packing="quad",
+                                   name="UD"):
+        """
+        Fibre bed of fibre volume fraction Vf and fibre radius [m]. K1, K2
+        from Gebart (1992):
+
+            K1 = 8 R^2 / c (1 - Vf)^3 / Vf^2
+            K2 = C1 (sqrt(Vf_max / Vf) - 1)^(5/2) R^2
+
+        with c = 57 and C1 = 16 / (9 pi sqrt 2), Vf_max = pi/4 for the
+        quadratic packing; c = 53, C1 = 16 / (9 pi sqrt 6),
+        Vf_max = pi / (2 sqrt 3) for the hexagonal one (packing "quad" /
+        "hex"). Porosity 1 - Vf. Valid for aligned, evenly spaced fibres
+        (no bundle structure, no nesting); real fabrics can differ by a
+        factor of a few, so fit to a measurement when one exists.
+        """
+        k1, k2 = cls._fibre_bed(Vf, fibre_radius, packing)
+        mat = cls(name).set_permeability(k1, k2).set_porosity(1.0 - float(Vf))
+        mat._model = dict(kind="fibre_volume_fraction", Vf=float(Vf),
+                          fibre_radius=float(fibre_radius), packing=packing)
+        return mat
+
+    @classmethod
+    def from_tape_layup(cls, tape_width, gap_width, tape_thickness, Vf,
+                        fibre_radius, packing="quad", name="UD tape"):
+        """
+        Tapes of width w, thickness t and fibre volume fraction Vf [m],
+        laid side by side with an open gap g between them (gap_width may
+        be 0). The tape's own K1t, K2t are Gebart's (see
+        from_fibre_volume_fraction). Per unit length across the layup:
+
+        * along the tapes the tape and the gap flow in parallel:
+              K1 = (w K1t + g Kg) / (w + g)
+          Kg is the permeability of the open gap seen as a rectangular
+          duct g x t (a^2/12 for a long slot, 0.0351 a^2 for a square
+          one): the gaps are the fast channels;
+        * across the tapes the flow crosses tape and gap in series; the
+          gap is taken as free of resistance,
+              K2 = K2t (w + g) / w
+          which is an upper bound for the gap contribution.
+
+        Porosity: (w (1 - Vf) + g) / (w + g), the gap being fully open
+        over the full thickness. Gaps closed or partly filled by tape
+        spread or by the plies above and below are not modelled: scale
+        gap_width to the open width, or overwrite K1 with a measurement.
+        """
+        w = _positive(tape_width, "tape_width")
+        g = _non_negative(gap_width, "gap_width")
+        t = _positive(tape_thickness, "tape_thickness")
+        k1t, k2t = cls._fibre_bed(Vf, fibre_radius, packing)
+        kg = _duct_permeability(g, t) if g > 0.0 else 0.0
+        k1 = (w * k1t + g * kg) / (w + g)
+        k2 = k2t * (w + g) / w
+        phi = (w * (1.0 - float(Vf)) + g) / (w + g)
+        mat = cls(name).set_permeability(k1, k2).set_porosity(phi)
+        mat._model = dict(kind="tape_layup", tape_width=w, gap_width=g,
+                          tape_thickness=t, Vf=float(Vf),
+                          fibre_radius=float(fibre_radius), packing=packing)
+        return mat
+
+    def validate(self, thermal=False):
+        super().validate(thermal=thermal)
+        if self._K1 < self._K2:
+            warnings.warn(f"{self!r}: K1 ({self._K1:.3g}) < K2 "
+                          f"({self._K2:.3g}); K1 is the permeability along "
+                          f"the fibres", RuntimeWarning, stacklevel=2)
+
+
 class Ply:
     """
     One ply: a fabric, its thickness [m] and fibre direction.
@@ -549,6 +692,18 @@ class SolverSettings:
                              implicitly; False: two-point flux only
                              (inconsistent on skewed cells or anisotropic K,
                              for comparison)
+      flux_scheme            "lsq": the flux above (default); "monotone":
+                             nonlinear two-point flux with positive
+                             coefficients (Le Potier / Lipnikov et al.): the
+                             pressure obeys the maximum principle for any
+                             anisotropy (no under- or overshoot at vents or
+                             ports), at the cost of a Picard iteration of
+                             the pressure solve in every step
+      picard_tol             Picard convergence of "monotone": largest
+                             pressure change / (p_inlet - p_init)
+      picard_max             nonlinear iterations per pressure solve
+      anderson_depth         previous iterates kept by the Anderson
+                             acceleration of the nonlinear iteration
       fill_fraction_per_step a step ends when this fraction of the front
                              cells is full (at least one cell); resin beyond
                              f = 1 passes to the dry neighbours. 0 = one
@@ -599,6 +754,10 @@ class SolverSettings:
         direct_max_cells=50000,
         iterative_rtol=1e-10,
         flux_correction=True,
+        flux_scheme="lsq",
+        picard_tol=1e-9,
+        picard_max=100,
+        anderson_depth=8,
         fill_fraction_per_step=0.1,
         fill_tol=1e-12,
         pocket_tol=1e-3,
@@ -631,6 +790,8 @@ class SolverSettings:
                                                   "iterative"):
                 raise ValueError("linear_solver must be 'auto', 'direct' or "
                                  "'iterative'")
+            if k == "flux_scheme" and v not in ("lsq", "monotone"):
+                raise ValueError("flux_scheme must be 'lsq' or 'monotone'")
             if k == "fill_fraction_per_step" and not 0.0 <= v < 1.0:
                 raise ValueError("fill_fraction_per_step must be in [0, 1)")
             self._values[k] = v
@@ -2353,6 +2514,357 @@ def _m4_net_inflow(fi, fj, Tf, gf, oc, To, go, p, p_vent, N):
     return Q, q_out
 
 
+# --------------------------------------------------------------------------
+# Monotone flux scheme (flux_scheme="monotone"): nonlinear two-point flux
+# --------------------------------------------------------------------------
+# One-sided flux of a cell through a face with positive coefficients (cone
+# condition on the cell's neighbour points), joined across the face by the
+# nonlinear combination of Le Potier (2005) / Lipnikov, Svyatskiy and
+# Vassilevski (2009): the pressure matrix is an M-matrix, so the discrete
+# solution obeys the maximum principle for any anisotropy.
+_NTP_MU_MARGIN = 1e-3     # see _ntp_assemble
+
+
+def build_boundary_edges(mesh, thickness, Kxx, Kxy, Kyy, viscosity):
+    """
+    Every mesh boundary edge as (owner cell, conormal nu = (h L / mu) K n,
+    centre-to-edge-midpoint offset d), in the owner's frame.
+    """
+    cg = mesh.cellgridid
+    edges = cg[:, [0, 1, 1, 2, 0, 2]].reshape(-1, 2)
+    rows = np.asarray(trimesh.grouping.group_rows(edges, require_count=1),
+                      dtype=np.int64).ravel()
+    owner = rows // 3
+    tau, _, sx, sy, dx, dy = _half_faces(mesh, element_frames(mesh), owner,
+                                         edges[rows], thickness, Kxx, Kxy,
+                                         Kyy, viscosity)
+    return owner, sx + tau * dx, sy + tau * dy, dx, dy
+
+
+@dataclass
+class MonotoneGeom:
+    """
+    Static geometry of the monotone scheme. Cell c has K neighbour slots
+    followed by 3 boundary slots, P = K + 3 flux faces / stencil points:
+    slot k < K the face to neighbour k, slot K + m the m-th outlet edge
+    (only for vent cells). nu is the conormal of the face seen from c,
+    fslot[f, side] the slot of face f in each of its two cells, and
+    wall_* the no-flux boundary edges (conormal K n_w) of c.
+    """
+    nu_x: np.ndarray
+    nu_y: np.ndarray
+    opx: np.ndarray
+    opy: np.ndarray
+    ovalid: np.ndarray
+    wvx: np.ndarray
+    wvy: np.ndarray
+    nwall: np.ndarray
+    fslot: np.ndarray
+    fdx: np.ndarray
+    fdy: np.ndarray
+
+
+def build_monotone_geometry(fg, nbrs, bnd, is_vent):
+    N, K = nbrs.shape
+    P = K + 3
+    nu_x = np.zeros((N, P))
+    nu_y = np.zeros((N, P))
+    nu_x[:, :K] = fg.per_slot(fg.sx + fg.tau * fg.dx)
+    nu_y[:, :K] = fg.per_slot(fg.sy + fg.tau * fg.dy)
+    opx = np.zeros((N, 3))
+    opy = np.zeros((N, 3))
+    ovalid = np.zeros((N, 3), dtype=bool)
+    wvx = np.zeros((N, 3))
+    wvy = np.zeros((N, 3))
+    nwall = np.zeros(N, dtype=np.int64)
+    n_out = np.zeros(N, dtype=np.int64)
+    owner, bnx, bny, bdx, bdy = bnd
+    for e in range(owner.size):
+        c = owner[e]
+        if is_vent[c]:
+            m = n_out[c]
+            n_out[c] += 1
+            nu_x[c, K + m], nu_y[c, K + m] = bnx[e], bny[e]
+            opx[c, m], opy[c, m] = bdx[e], bdy[e]
+            ovalid[c, m] = True
+        else:
+            w = nwall[c]
+            nwall[c] += 1
+            wvx[c, w], wvy[c, w] = bnx[e], bny[e]
+    fslot = np.full((fg.fi.size, 2), -1, dtype=np.int64)
+    c_i, k_i = np.nonzero(fg.slot_face >= 0)
+    fslot[fg.slot_face[c_i, k_i], fg.slot_side[c_i, k_i]] = k_i
+    return MonotoneGeom(nu_x=nu_x, nu_y=nu_y, opx=opx, opy=opy, ovalid=ovalid,
+                        wvx=wvx, wvy=wvy, nwall=nwall, fslot=fslot,
+                        fdx=fg.per_slot(fg.dx), fdy=fg.per_slot(fg.dy))
+
+
+@njit(cache=True)
+def _ntp_cones(nbrs, state, ccx, ccy, fdx, fdy, opx, opy, ovalid, nu_x, nu_y,
+               wvx, wvy, nwall, cia, cib, cta, ctb):
+    """
+    Positive decomposition of every face conormal over the cell's points:
+    nu = ta d_a + tb d_b (+ c w for a no-flux wall of conormal w, c of any
+    sign), ta, tb >= 0, so the one-sided outflow through the face is exact
+    for a linear pressure: F = ta (p_c - p_a) + tb (p_c - p_b). The
+    representation with the smallest ta + tb is used. Without one (very
+    skewed cells) the best single point with a non-negative projection is
+    used, which is consistent only for nu along it. Returns that count.
+    """
+    N, K = nbrs.shape
+    P = K + 3
+    n_fail = 0
+    px = np.zeros(P)
+    py = np.zeros(P)
+    ok = np.zeros(P, dtype=np.bool_)
+    for c in range(N):
+        for s in range(P):
+            ok[s] = False
+        for k in range(K):
+            j = nbrs[c, k]
+            if j < 0:
+                break
+            ok[k] = True
+            if state[j] == M4_INLET or state[j] == M4_HOLE:
+                px[k] = fdx[c, k]
+                py[k] = fdy[c, k]
+            else:
+                px[k] = ccx[c, k]
+                py[k] = ccy[c, k]
+        for m in range(3):
+            if ovalid[c, m]:
+                ok[K + m] = True
+                px[K + m] = opx[c, m]
+                py[K + m] = opy[c, m]
+        for s in range(P):
+            cia[c, s] = -1
+            cib[c, s] = -1
+            cta[c, s] = 0.0
+            ctb[c, s] = 0.0
+            if not ok[s]:
+                continue
+            nx = nu_x[c, s]
+            ny = nu_y[c, s]
+            nn = np.hypot(nx, ny)
+            best = np.inf
+            for a in range(P):
+                if not ok[a]:
+                    continue
+                da = np.hypot(px[a], py[a])
+                tol_a = 1e-9 * nn / da
+                for w in range(nwall[c]):
+                    wn = np.hypot(wvx[c, w], wvy[c, w])
+                    cr = px[a] * wvy[c, w] - py[a] * wvx[c, w]
+                    if abs(cr) < 1e-9 * da * wn:
+                        continue
+                    ta = (nx * wvy[c, w] - ny * wvx[c, w]) / cr
+                    if ta >= -tol_a and max(ta, 0.0) < best:
+                        best = max(ta, 0.0)
+                        cia[c, s] = a
+                        cta[c, s] = best
+                        cib[c, s] = -1
+                        ctb[c, s] = 0.0
+                for b in range(a + 1, P):
+                    if not ok[b]:
+                        continue
+                    db = np.hypot(px[b], py[b])
+                    det = px[a] * py[b] - py[a] * px[b]
+                    if abs(det) < 1e-9 * da * db:
+                        continue
+                    ta = (nx * py[b] - ny * px[b]) / det
+                    tb = (px[a] * ny - py[a] * nx) / det
+                    if ta >= -tol_a and tb >= -1e-9 * nn / db:
+                        ta = max(ta, 0.0)
+                        tb = max(tb, 0.0)
+                        if ta + tb < best:
+                            best = ta + tb
+                            cia[c, s] = a
+                            cib[c, s] = b
+                            cta[c, s] = ta
+                            ctb[c, s] = tb
+            if best == np.inf:
+                n_fail += 1
+                bc = -2.0
+                for a in range(P):
+                    if not ok[a]:
+                        continue
+                    da = np.hypot(px[a], py[a])
+                    cs = (nx * px[a] + ny * py[a]) / (nn * da)
+                    if cs > bc:
+                        bc = cs
+                        cia[c, s] = a
+                        cta[c, s] = max(nx * px[a] + ny * py[a], 0.0) / (da * da)
+    return n_fail
+
+
+@njit(cache=True)
+def _ntp_ab(c, s, nbrs, cia, cib, cta, ctb, pt, pvt, K):
+    """alpha = sum t and B = sum t p of the points of face slot s of cell c."""
+    alpha = 0.0
+    B = 0.0
+    for q in range(2):
+        a = cia[c, s] if q == 0 else cib[c, s]
+        t = cta[c, s] if q == 0 else ctb[c, s]
+        if a < 0 or t == 0.0:
+            continue
+        alpha += t
+        B += t * max(pt[nbrs[c, a]] if a < K else pvt, 0.0)
+    return alpha, B
+
+
+@njit(cache=True)
+def _ntp_one(row, c, s, sg, nbrs, cia, cib, cta, ctb, uid, pt, pvt, K, rows,
+             cols, vals, rhs, nnz):
+    """Add sg x (one-sided outflow of cell c through face slot s) to `row`."""
+    for q in range(2):
+        a = cia[c, s] if q == 0 else cib[c, s]
+        t = cta[c, s] if q == 0 else ctb[c, s]
+        if a < 0 or t == 0.0:
+            continue
+        nnz = _m4_add(row, c, sg * t, uid, pt, rows, cols, vals, rhs, nnz)
+        if a < K:
+            nnz = _m4_add(row, nbrs[c, a], -sg * t, uid, pt, rows, cols, vals,
+                          rhs, nnz)
+        else:
+            rhs[row] += sg * t * pvt
+    return nnz
+
+
+@njit(cache=True)
+def _ntp_assemble(fi, fj, tau, tau_n, fslot, nbrs, cia, cib, cta, ctb, ovalid,
+                  state, uid, pt, n_unk, pvt, mu):
+    """
+    Pressure system of the monotone scheme in the shifted pressure pt = p -
+    p_ref >= 0. Face fluxes (outflow of cell i):
+      full - full   (B_j alpha_i pt_i - B_i alpha_j pt_j) / (B_i + B_j)
+                    from the one-sided fluxes alpha pt_c - B of both sides
+                    (mu = B_j / (B_i + B_j), kept in mu for the flux)
+      full - open   two-point, tau_n (the face is a piece of the front)
+      full - inlet / hole, outlet edges   one-sided flux
+    Diagonal >= 0, off-diagonal <= 0, columns sum to >= 0: an M-matrix.
+    """
+    nf = fi.size
+    N, K = nbrs.shape
+    P = K + 3
+    size = 4 * nf + 3 * N * P + 1
+    rows = np.empty(size, dtype=np.int64)
+    cols = np.empty(size, dtype=np.int64)
+    vals = np.empty(size)
+    rhs = np.zeros(n_unk)
+    nnz = 0
+    for f in range(nf):
+        i = fi[f]
+        j = fj[f]
+        si = state[i]
+        sj = state[j]
+        if not _m4_has_flux(si, sj):
+            continue
+        ri = uid[i]
+        rj = uid[j]
+        if si == M4_OPEN or sj == M4_OPEN:
+            T, _, _ = _m4_face_weights(si, sj, tau[f, 0], tau[f, 1],
+                                       tau_n[f, 0], tau_n[f, 1], False)
+            if ri >= 0:
+                nnz = _m4_add(ri, i, T, uid, pt, rows, cols, vals, rhs, nnz)
+                nnz = _m4_add(ri, j, -T, uid, pt, rows, cols, vals, rhs, nnz)
+            if rj >= 0:
+                nnz = _m4_add(rj, j, T, uid, pt, rows, cols, vals, rhs, nnz)
+                nnz = _m4_add(rj, i, -T, uid, pt, rows, cols, vals, rhs, nnz)
+        elif si == M4_FULL and sj == M4_FULL:
+            ai, Bi = _ntp_ab(i, fslot[f, 0], nbrs, cia, cib, cta, ctb, pt, pvt, K)
+            aj, Bj = _ntp_ab(j, fslot[f, 1], nbrs, cia, cib, cta, ctb, pt, pvt, K)
+            den = Bi + Bj
+            # mu = B_j / (B_i + B_j), kept off 0 and 1 (a zero diagonal makes
+            # the system singular) by a margin relative to the share
+            # alpha_j / (alpha_i + alpha_j) it would take for a linear
+            # pressure at large shift, so strong anisotropy (alpha_i >>
+            # alpha_j) is not distorted.
+            nat = aj / (ai + aj) if ai + aj > 0.0 else 0.5
+            m = (0.5 if den <= 0.0 else
+                 min(max(Bj / den, _NTP_MU_MARGIN * nat),
+                     1.0 - _NTP_MU_MARGIN * (1.0 - nat)))
+            mu[f] = m
+            if ai == 0.0 and aj == 0.0:
+                continue
+            nnz = _m4_add(ri, i, m * ai, uid, pt, rows, cols, vals, rhs, nnz)
+            nnz = _m4_add(ri, j, -(1.0 - m) * aj, uid, pt, rows, cols, vals,
+                          rhs, nnz)
+            nnz = _m4_add(rj, j, (1.0 - m) * aj, uid, pt, rows, cols, vals,
+                          rhs, nnz)
+            nnz = _m4_add(rj, i, -m * ai, uid, pt, rows, cols, vals, rhs, nnz)
+        elif si == M4_FULL:
+            nnz = _ntp_one(ri, i, fslot[f, 0], 1.0, nbrs, cia, cib, cta, ctb,
+                           uid, pt, pvt, K, rows, cols, vals, rhs, nnz)
+        elif sj == M4_FULL:
+            nnz = _ntp_one(rj, j, fslot[f, 1], 1.0, nbrs, cia, cib, cta, ctb,
+                           uid, pt, pvt, K, rows, cols, vals, rhs, nnz)
+    for c in range(N):
+        if state[c] != M4_FULL:
+            continue
+        for m in range(3):
+            if ovalid[c, m]:
+                nnz = _ntp_one(uid[c], c, K + m, 1.0, nbrs, cia, cib, cta, ctb,
+                               uid, pt, pvt, K, rows, cols, vals, rhs, nnz)
+    return rows[:nnz], cols[:nnz], vals[:nnz], rhs
+
+
+@njit(cache=True)
+def _ntp_flux_one(c, s, nbrs, cia, cib, cta, ctb, pt, pvt, K):
+    """One-sided outflow of cell c through face slot s."""
+    F = 0.0
+    for q in range(2):
+        a = cia[c, s] if q == 0 else cib[c, s]
+        t = cta[c, s] if q == 0 else ctb[c, s]
+        if a < 0 or t == 0.0:
+            continue
+        F += t * (pt[c] - (pt[nbrs[c, a]] if a < K else pvt))
+    return F
+
+
+@njit(cache=True)
+def _ntp_net_inflow(fi, fj, tau, tau_n, fslot, nbrs, cia, cib, cta, ctb,
+                    ovalid, state, pt, pvt, mu):
+    """Net Darcy inflow of every cell and the outlet outflow, as assembled."""
+    nf = fi.size
+    N, K = nbrs.shape
+    Q = np.zeros(N)
+    q_out = 0.0
+    for f in range(nf):
+        i = fi[f]
+        j = fj[f]
+        si = state[i]
+        sj = state[j]
+        if not _m4_has_flux(si, sj):
+            continue
+        if si == M4_OPEN or sj == M4_OPEN:
+            T, _, _ = _m4_face_weights(si, sj, tau[f, 0], tau[f, 1],
+                                       tau_n[f, 0], tau_n[f, 1], False)
+            F = T * (pt[i] - pt[j])
+        elif si == M4_FULL and sj == M4_FULL:
+            ai, _ = _ntp_ab(i, fslot[f, 0], nbrs, cia, cib, cta, ctb, pt, pvt, K)
+            aj, _ = _ntp_ab(j, fslot[f, 1], nbrs, cia, cib, cta, ctb, pt, pvt, K)
+            F = mu[f] * ai * pt[i] - (1.0 - mu[f]) * aj * pt[j]
+        elif si == M4_FULL:
+            F = _ntp_flux_one(i, fslot[f, 0], nbrs, cia, cib, cta, ctb, pt,
+                              pvt, K)
+        else:
+            F = -_ntp_flux_one(j, fslot[f, 1], nbrs, cia, cib, cta, ctb, pt,
+                               pvt, K)
+        Q[j] += F
+        Q[i] -= F
+    for c in range(N):
+        if state[c] != M4_FULL:
+            continue
+        for m in range(3):
+            if ovalid[c, m]:
+                F = _ntp_flux_one(c, K + m, nbrs, cia, cib, cta, ctb, pt, pvt,
+                                  K)
+                Q[c] -= F
+                q_out += F
+    return Q, q_out
+
+
+
 @njit(cache=True)
 def _m4_spill(excess, f, phiV, take, state, tau_out, nbrs, slot_face, Tgeo,
               Q, f_full):
@@ -2426,6 +2938,39 @@ def _m4_spill(excess, f, phiV, take, state, tau_out, nbrs, slot_face, Tgeo,
                 take[j] = False
                 state[j] = M4_FULL
     return vented, spilled
+
+
+def _anderson(G, x0, depth, max_iter, tol):
+    """
+    Anderson-accelerated fixed point x = G(x) (the Picard map of the
+    monotone scheme diverges undamped). Returns (x, iterations, converged,
+    G(x)): the last evaluation is at the returned x, so a caller that needs
+    the matrix of that map keeps the one G was last assembled with.
+    """
+    x = np.array(x0, dtype=np.float64)
+    gx = G(x)
+    g = gx - x
+    err = float(np.max(np.abs(g)))
+    dX, dG = [], []
+    x_old, g_old = x, g
+    for it in range(1, max_iter + 1):
+        if err <= tol:
+            return x, it, True, gx
+        x = x + g if not dX else x
+        if dX:
+            dr = np.array(dG).T
+            gamma, *_ = np.linalg.lstsq(dr, g, rcond=None)
+            x = x_old + g - (np.array(dX).T + dr) @ gamma
+        gx = G(x)
+        g_new = gx - x
+        err = float(np.max(np.abs(g_new)))
+        dX.append(x - x_old)
+        dG.append(g_new - g)
+        if len(dX) > depth:
+            dX.pop(0)
+            dG.pop(0)
+        x_old, g = x, g_new
+    return x, max_iter, err <= tol, gx
 
 
 def _m4_linear_solve(rows, cols, vals, rhs, n, x0, method, rtol):
@@ -3288,6 +3833,75 @@ class RTMSimulation:
                                    fg.dx, fg.dy, state)
         Wx, Wy = lsq_weights()
 
+        monotone = st.flux_scheme == "monotone"
+        n_picard = n_picard_open = n_cone_fail = 0
+        p_ref = p_out           # lowest pressure: the shifted p - p_ref >= 0
+        if monotone:
+            bnd = build_boundary_edges(mesh, thickness, Kxx, Kxy, Kyy,
+                                       viscosity)
+            mg = build_monotone_geometry(fg, nbrs, bnd, is_vent)
+            cia = np.empty((N, k_used + 3), dtype=np.int64)
+            cib = np.empty((N, k_used + 3), dtype=np.int64)
+            cta = np.empty((N, k_used + 3))
+            ctb = np.empty((N, k_used + 3))
+            mu = np.full(fi.size, 0.5)
+
+            def compute_cones():
+                return _ntp_cones(nbrs, state, ccx, ccy, mg.fdx, mg.fdy,
+                                  mg.opx, mg.opy, mg.ovalid, mg.nu_x, mg.nu_y,
+                                  mg.wvx, mg.wvy, mg.nwall, cia, cib, cta, ctb)
+            n_cone_fail = compute_cones()
+
+        def monotone_pressure(cap, unk, uid, n_full, n_pk, n_unk, pk_cells,
+                              pk_id, pk_p0, method):
+            """
+            Picard iteration of the monotone scheme (coefficients from the
+            previous iterate, an M-matrix solve each). Updates p and mu in
+            place, returns the unknowns (full cells, pockets) and the number
+            of iterations; the last iteration's mu stays in force, so the
+            fluxes match the last matrix.
+            """
+            pt = p - p_ref
+            x0 = np.concatenate([pt[unk], pk_p0 - p_ref])
+            if n_unk == 0:
+                return x0 + p_ref, 0, True
+
+            def G(x):
+                """Solve with the coefficients of the iterate x."""
+                pt[unk] = x[:n_full]
+                pt[pk_cells] = x[n_full + pk_id]
+                rows, cols, vals, rhs = _ntp_assemble(
+                    fi, fj, fg.tau, fg.tau_n, mg.fslot, nbrs, cia, cib, cta,
+                    ctb, mg.ovalid, state, uid, pt, n_unk, p_out - p_ref, mu)
+                if n_pk:
+                    k_pk = n_full + np.arange(n_pk)
+                    rows = np.concatenate([rows, k_pk])
+                    cols = np.concatenate([cols, k_pk])
+                    vals = np.concatenate([vals, cap])
+                    rhs[n_full:] += cap * (pk_p0 - p_ref)
+                xn = _m4_linear_solve(rows, cols, vals, rhs, n_unk, x, method,
+                                      st.iterative_rtol)
+                if not np.all(np.isfinite(xn)):
+                    raise FloatingPointError(
+                        f"i_model=4: monotone pressure solve failed at "
+                        f"t={t:.4g} s ({n_full} full cells, {n_pk} air "
+                        f"pockets)")
+                counter[0] += 1
+                return xn
+            counter = [0]
+            tol = float(st.picard_tol) * (p_in - p_out)
+            x, _, converged, _ = _anderson(G, x0, int(st.anderson_depth),
+                                           int(st.picard_max), tol)
+            # One more map evaluation at x: the pressure is the solution of
+            # the matrix assembled with the coefficients of x, so the fluxes
+            # (net inflow, with the same mu) balance exactly.
+            x = G(x)
+            pt[unk] = x[:n_full]
+            pt[pk_cells] = x[n_full + pk_id]
+            p[unk] = pt[unk] + p_ref
+            p[pk_cells] = pt[pk_cells] + p_ref
+            return x + p_ref, counter[0], converged
+
         # Air moves between open cells that share a vertex: a cell wedged
         # between two filled neighbours (e.g. where the front meets a wall)
         # still vents through its corners.
@@ -3360,7 +3974,11 @@ class RTMSimulation:
             if n_act:
                 tau_c = (1.0 - f[active]) * phiV[active] / Q[active]
                 m = max(1, int(frac * n_act))
-                dt = min(dt, float(np.partition(tau_c, m - 1)[m - 1]))
+                dt_c = float(np.partition(tau_c, m - 1)[m - 1])
+                if monotone:
+                    dt_c *= 1.0 + 1e-6   # cells filling together up to
+                                         # the iteration's round-off
+                dt = min(dt, dt_c)
             if pk_Q.size:
                 with np.errstate(divide="ignore"):
                     lim = _POCKET_MAX_SHRINK * pk_vol / np.abs(pk_Q)
@@ -3392,6 +4010,8 @@ class RTMSimulation:
                 fill_time[new] = np.where(np.isnan(fill_time[new]), t,
                                           fill_time[new])
                 Wx, Wy = lsq_weights()
+                if monotone:
+                    compute_cones()
                 topo_changed = True
             if np.all(f[fill_region] >= 1.0):
                 complete = True
@@ -3431,34 +4051,50 @@ class RTMSimulation:
             dt_guess = dt
             for _ in range(3 if n_pk else 1):
                 cap = pk_vol / (pk_p0 * dt_guess)
-                if n_unk:
-                    rows, cols, vals, rhs = _m4_assemble(
-                        fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau,
-                        osx, osy, nbrs, Wx, Wy, state, uid, p, n_unk, p_out,
-                        correct)
-                    if n_pk:
-                        k_pk = n_full + np.arange(n_pk)
-                        rows = np.concatenate([rows, k_pk])
-                        cols = np.concatenate([cols, k_pk])
-                        vals = np.concatenate([vals, cap])
-                        rhs[n_full:] += cap * pk_p0
-                    x0 = np.concatenate([p[unk], pk_p0])
-                    x = _m4_linear_solve(rows, cols, vals, rhs, n_unk, x0,
-                                         method, st.iterative_rtol)
-                    if not np.all(np.isfinite(x)):
-                        raise FloatingPointError(
-                            f"i_model=4: pressure solve failed at t={t:.4g} s "
-                            f"(step {step}, {n_full} full cells, {n_pk} air "
-                            f"pockets)")
-                    n_solves += 1
-                    p[unk] = x[:n_full]
-                    p[pk_cells] = x[n_full + pk_id]
-                _m4_gradient(nbrs, Wx, Wy, p, state, gx, gy)
-                Tf, gf, To, go = _m4_face_terms(
-                    fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau, osx,
-                    osy, state, gx, gy, correct)
-                Q, q_out = _m4_net_inflow(fi, fj, Tf, gf, oc, To, go, p,
-                                          p_out, N)
+                if monotone:
+                    x, n_it, conv = monotone_pressure(
+                        cap, unk, uid, n_full, n_pk, n_unk, pk_cells, pk_id,
+                        pk_p0, method)
+                    n_solves += n_it
+                    n_picard += n_it
+                    n_picard_open += int(not conv)
+                    Tf, _, To, _ = _m4_face_terms(
+                        fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau, osx,
+                        osy, state, gx, gy, False)
+                    Q, q_out = _ntp_net_inflow(
+                        fi, fj, fg.tau, fg.tau_n, mg.fslot, nbrs, cia, cib,
+                        cta, ctb, mg.ovalid, state, p - p_ref, p_out - p_ref,
+                        mu)
+                else:
+                    cap = pk_vol / (pk_p0 * dt_guess)
+                    if n_unk:
+                        rows, cols, vals, rhs = _m4_assemble(
+                            fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau,
+                            osx, osy, nbrs, Wx, Wy, state, uid, p, n_unk, p_out,
+                            correct)
+                        if n_pk:
+                            k_pk = n_full + np.arange(n_pk)
+                            rows = np.concatenate([rows, k_pk])
+                            cols = np.concatenate([cols, k_pk])
+                            vals = np.concatenate([vals, cap])
+                            rhs[n_full:] += cap * pk_p0
+                        x0 = np.concatenate([p[unk], pk_p0])
+                        x = _m4_linear_solve(rows, cols, vals, rhs, n_unk, x0,
+                                             method, st.iterative_rtol)
+                        if not np.all(np.isfinite(x)):
+                            raise FloatingPointError(
+                                f"i_model=4: pressure solve failed at t={t:.4g} s "
+                                f"(step {step}, {n_full} full cells, {n_pk} air "
+                                f"pockets)")
+                        n_solves += 1
+                        p[unk] = x[:n_full]
+                        p[pk_cells] = x[n_full + pk_id]
+                    _m4_gradient(nbrs, Wx, Wy, p, state, gx, gy)
+                    Tf, gf, To, go = _m4_face_terms(
+                        fi, fj, fg.tau, fg.tau_n, fg.sx, fg.sy, oc, otau, osx,
+                        osy, state, gx, gy, correct)
+                    Q, q_out = _m4_net_inflow(fi, fj, Tf, gf, oc, To, go, p,
+                                              p_out, N)
                 pk_Q = np.bincount(pk_id, weights=Q[pk_cells], minlength=n_pk)
                 dt, n_act = step_length(Q, in_pocket, pk_Q, pk_vol)
                 if not n_pk or 0.5 <= dt / dt_guess <= 2.0:
@@ -3569,7 +4205,8 @@ class RTMSimulation:
         self._m4_info = dict(
             n_steps=step, n_solves=n_solves, injected=injected,
             stored=float((f * phiV)[preform].sum()), vented=vented,
-            spilled=spilled, dry_spots=dry_spots)
+            spilled=spilled, dry_spots=dry_spots, n_picard=n_picard,
+            n_picard_unconverged=n_picard_open, n_cone_fail=int(n_cone_fail))
         return snapshots
 
     # ------------------------------------------------------------------
@@ -3606,9 +4243,19 @@ class RTMSimulation:
                 for d in self._require_m4()["dry_spots"]]
 
     def get_run_stats(self):
-        """i_model=4: number of time steps and pressure solves."""
+        """
+        i_model=4: number of time steps and linear pressure solves; with
+        flux_scheme="monotone" also the Picard iterations in total, the
+        pressure solves that stopped at picard_max, and the number of faces
+        that had no positive decomposition (n_cone_fail, see _ntp_cones).
+        """
         info = self._require_m4()
-        return dict(n_steps=info["n_steps"], n_solves=info["n_solves"])
+        out = dict(n_steps=info["n_steps"], n_solves=info["n_solves"])
+        if self._settings.flux_scheme == "monotone":
+            out.update(n_picard=info["n_picard"],
+                       n_picard_unconverged=info["n_picard_unconverged"],
+                       n_cone_fail=info["n_cone_fail"])
+        return out
 
     def _require_results(self):
         if not self._snapshots:

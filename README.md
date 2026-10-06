@@ -34,6 +34,20 @@ The above describes process models 1–3 (`set_process_model(1|2|3)`). In models
   (curved shells, harmonic K across faces). The flux is two-point plus an implicit
   least-squares correction for skewed cells and anisotropic K; front faces are
   two-point (the face is the front), so resin never leaves a front cell.
+- **Flux scheme:** `flux_scheme="lsq"` (default) is the two-point flux plus the
+  implicit gradient correction above. `flux_scheme="monotone"` builds every flux
+  from positive coefficients (nonlinear two-point flux of Le Potier and of
+  Lipnikov, Svyatskiy and Vassilevski): the pressure obeys the maximum principle
+  for any anisotropy and mesh skew handled by the cone condition (no
+  under- or overshoot at vents and ports), and a strongly anisotropic strip
+  (K1/K2 = 680, fibres across the flow) fills to the end with a fill time
+  within 0.01 % of the exact one, where the default scheme is 1 % off and
+  stalls at the vent. It costs an Anderson-accelerated nonlinear iteration in
+  every pressure solve (about 15-20 linear solves per step), so runs are about
+  5-6 times slower, and it is slightly less accurate on the V3 ellipse
+  (axis ratio 3.4 % off at 10 mm against 2.8 %). `get_run_stats()` then also
+  reports the iterations, the solves that stopped at `picard_max` and the faces
+  without a positive decomposition (`n_cone_fail`, expected 0).
 - **Trapped air:** dry regions cut off from every vent are isothermal ideal gas
   (`p V = const`), solved implicitly with the pressure; pockets left in balance with the
   resin are reported by `get_dry_spots()`.
@@ -125,6 +139,38 @@ sim.set_laminate(base).add_laminate_region(pad, pad_cells)
 sim.set_fibre_deviation(shear_deg)      # optional, (N,) [deg]
 stacks, stack_id = sim.get_laminate_map()
 ```
+
+### Unidirectional fabric and slit tape
+
+`UDMaterial` is a `FabricMaterial` whose K1 (along the fibres), K2 (across)
+and porosity are computed from what is known about the material. It goes
+into `add_ply` like any fabric; `refdir` is the fibre / tape direction.
+
+```python
+# fibre bed: Gebart's model from fibre volume fraction and fibre radius [m]
+ud = rtm.UDMaterial.from_fibre_volume_fraction(0.55, fibre_radius=3.5e-6,
+                                               packing="quad")   # or "hex"
+# slit tape laid side by side with an open gap between the tapes [m]
+tape = rtm.UDMaterial.from_tape_layup(tape_width=6.35e-3, gap_width=0.3e-3,
+                                      tape_thickness=0.15e-3, Vf=0.55,
+                                      fibre_radius=3.5e-6)
+tape.get_permeability(), tape.get_porosity()
+```
+
+Along the tapes the tape and the open gap (a rectangular duct) flow in
+parallel, so the gaps raise K1 strongly; across the tapes the flow crosses
+tape and gap in series, the gap taken as free of resistance (an upper
+bound). The gap is assumed open over the full thickness; scale `gap_width`
+to the open width, or overwrite K1 / K2 / porosity with measured values
+through the inherited setters. The flow is still averaged through the stack
+thickness: gap channels act through the element tensor, not as a separate
+path. `validation/verification_ud.py` checks the constructors and the
+tensor through the solver (1-D fronts, `[0/90]` pair).
+
+With strongly anisotropic material (K1/K2 of about 50 or more) and i_model 4,
+use `sim.set_solver_settings(flux_scheme="monotone")`, see below: the default
+flux can dip below the vent pressure there and leave the last cells next to
+a vent unfilled.
 
 A `refdir` nearly normal to some elements gives an ill-defined fibre
 angle there and triggers a warning; use per-element directions instead.
